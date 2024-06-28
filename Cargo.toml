@@ -1,0 +1,6 @@
+[workspace]
+
+members = [
+    "metime_core"
+]
+resolver = "2"
