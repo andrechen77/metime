@@ -8,3 +8,4 @@ edition = "2021"
 [dependencies]
 tokio = { version = "1.38.0", features = ["rt", "macros"] }
 rand = "0.8.5"
+thiserror = "1.0.61"
