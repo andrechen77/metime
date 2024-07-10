@@ -32,7 +32,7 @@ pub enum FastForwardError {
 mod test {
     use super::{client::*, server::*, transaction::*, *};
     use crate::digest::{DigestOutput, Digestible};
-    use std::{cell::{Ref, RefCell}, vec};
+    use std::{cell::{Cell, Ref, RefCell}, vec};
 
     #[derive(Debug, Clone, PartialEq, Eq, Hash)]
     enum VecOperation {
@@ -79,19 +79,20 @@ mod test {
     }
 
     struct ServerWrapper {
-        next_client_id: RefCell<u64>,
-        num_successes_to_ignore: RefCell<usize>,
+        next_client_id: Cell<u64>,
+        num_successes_to_ignore: Cell<usize>,
         server: RefCell<ServerSync<Vec<u32>, VecOperation>>,
     }
 
     impl ServerWrapper {
         fn new(server: ServerSync<Vec<u32>, VecOperation>) -> Self {
-            Self { next_client_id: RefCell::new(0), num_successes_to_ignore: RefCell::new(0), server: RefCell::new(server) }
+            Self { next_client_id: Cell::new(0), num_successes_to_ignore: Cell::new(0), server: RefCell::new(server) }
         }
 
         fn get_handle(&self) -> ServerHandle<'_> {
-            let client_id = ClientId(*self.next_client_id.borrow());
-            *self.next_client_id.borrow_mut() += 1;
+            let client_id = self.next_client_id.get();
+            self.next_client_id.set(client_id + 1);
+            let client_id = ClientId(client_id);
             self.server.borrow_mut().register_client(client_id.clone());
             ServerHandle { client_id, server: &*self }
         }
@@ -133,21 +134,17 @@ mod test {
             );
             match result {
                 Ok(ok) => {
-                    let mut num_successes_to_ignore = self.num_successes_to_ignore.borrow_mut();
-                    if *num_successes_to_ignore == 0 {
+                    let num_successes_to_ignore = self.num_successes_to_ignore.get();
+                    if num_successes_to_ignore == 0 {
                         Ok(ok)
                     } else {
-                        *num_successes_to_ignore -= 1;
+                        self.num_successes_to_ignore.set(num_successes_to_ignore - 1);
                         Err(PushError::CommunicationError(CommunicationError::NetworkError))
                     }
 
                 }
                 Err(err) => Err(PushError::FastForwardError(err)),
             }
-        }
-
-        fn set_num_successes_to_ignore(&self, num_successes_to_ignore: usize) {
-            *self.num_successes_to_ignore.borrow_mut() = num_successes_to_ignore;
         }
     }
 
@@ -268,7 +265,7 @@ mod test {
 
         client.apply_transaction(VecOperation::Push(4));
         client.apply_transaction(VecOperation::Push(5));
-        server.set_num_successes_to_ignore(1);
+        server.num_successes_to_ignore.set(1);
         client.synchronize_value().await.unwrap_err();
 
         assert_eq!(*server.get_blessed(), vec![1, 2, 3, 4, 5]);
@@ -293,7 +290,7 @@ mod test {
 
         alice.apply_transaction(VecOperation::Push(4));
         bob.apply_transaction(VecOperation::Push(5));
-        server.set_num_successes_to_ignore(2);
+        server.num_successes_to_ignore.set(2);
         // alice successfully pushes but doesn't get the confirmation
         alice.synchronize_value().await.unwrap_err();
         // bob gets alice's changes, rebases, and pushes again, but doesn't get the confirmation
