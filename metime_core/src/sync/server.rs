@@ -10,7 +10,7 @@ use super::{ClientId, FastForwardError};
 pub struct ClientInfo {
     /// The next sequence number that this client should use when pushing
     /// transactions.
-    pub sequence_number: u64,
+    sequence_number: u64,
     /// The digest of the version that this client has last seen. It is assumed
     /// that if a client requests transactions since this digest, then it will
     /// never request a digest of an earlier version. None means that the client
@@ -47,8 +47,8 @@ where
         self.client_info.insert(client_id, ClientInfo::default());
     }
 
-    pub fn get_client_info(&self, client: &ClientId) -> Option<&ClientInfo> {
-        self.client_info.get(client)
+    pub fn get_client_sequence_number(&self, client: &ClientId) -> Option<u64> {
+        self.client_info.get(client).map(|info| info.sequence_number)
     }
 
     pub fn get_transactions_since(

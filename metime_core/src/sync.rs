@@ -95,7 +95,7 @@ mod test {
         async fn download_whole(&self) -> (Vec<u32>, u64) {
             (
                 self.server.borrow().get_blessed().clone(),
-                self.server.borrow().get_client_info(&self.client_id).unwrap().sequence_number,
+                self.server.borrow().get_client_sequence_number(&self.client_id).unwrap(),
             )
         }
 
@@ -105,8 +105,7 @@ mod test {
         ) -> Option<(Vec<VecOperation>, u64)> {
             let transactions =
                 self.server.borrow_mut().get_transactions_since(version_digest)?.cloned().collect();
-            let seq_num =
-                self.server.borrow().get_client_info(&self.client_id).unwrap().sequence_number;
+            let seq_num = self.server.borrow().get_client_sequence_number(&self.client_id).unwrap();
             Some((transactions, seq_num))
         }
 
