@@ -84,8 +84,8 @@ mod test {
     }
 
     impl ServerWrapper {
-        fn new(server: Rc<RefCell<ServerSync<Vec<u32>, VecOperation>>>) -> Self {
-            let client_id = ClientId(rand::random());
+        fn new(server: Rc<RefCell<ServerSync<Vec<u32>, VecOperation>>>, client_id: u64) -> Self {
+            let client_id = ClientId(client_id);
             server.borrow_mut().register_client(client_id.clone());
             Self { client_id, server }
         }
@@ -129,7 +129,7 @@ mod test {
         let initial_version = vec![1, 2, 3];
         let server = Rc::new(RefCell::new(ServerSync::new(initial_version.clone())));
         let mut synced =
-            ClientSync::with_basis_version(ServerWrapper::new(server), initial_version, 0);
+            ClientSync::with_basis_version(ServerWrapper::new(server, 0), initial_version, 0);
         assert_eq!(synced.get_working_copy(), &vec![1, 2, 3]);
         synced.apply_transaction(VecOperation::Push(4));
         synced.apply_transaction(VecOperation::Push(5));
@@ -141,7 +141,7 @@ mod test {
     async fn initial_sync_works() {
         let initial_version = vec![1, 2, 3];
         let server = Rc::new(RefCell::new(ServerSync::new(initial_version)));
-        let mut synced = ClientSync::with_server_sync(ServerWrapper::new(server)).await;
+        let mut synced = ClientSync::with_server_sync(ServerWrapper::new(server, 0)).await;
         assert_eq!(synced.get_working_copy(), &vec![1, 2, 3]);
         synced.apply_transaction(VecOperation::Push(4));
         synced.apply_transaction(VecOperation::Push(5));
@@ -154,7 +154,7 @@ mod test {
     async fn invalid_initial_value_is_corrected() {
         let server = Rc::new(RefCell::new(ServerSync::new(vec![1, 2, 3])));
         let mut synced =
-            ClientSync::with_basis_version(ServerWrapper::new(server), vec![11, 22, 33], 0);
+            ClientSync::with_basis_version(ServerWrapper::new(server, 0), vec![11, 22, 33], 0);
         assert_eq!(synced.get_working_copy(), &vec![11, 22, 33]);
         synced.apply_transaction(VecOperation::Push(4));
         synced.apply_transaction(VecOperation::Push(5));
@@ -168,8 +168,8 @@ mod test {
     #[tokio::test]
     async fn multiple_clients_clean_sync() {
         let server = Rc::new(RefCell::new(ServerSync::new(vec![1, 2, 3])));
-        let mut alice = ClientSync::with_server_sync(ServerWrapper::new(server.clone())).await;
-        let mut bob = ClientSync::with_server_sync(ServerWrapper::new(server.clone())).await;
+        let mut alice = ClientSync::with_server_sync(ServerWrapper::new(server.clone(), 0)).await;
+        let mut bob = ClientSync::with_server_sync(ServerWrapper::new(server.clone(), 1)).await;
 
         bob.apply_transaction(VecOperation::Push(7));
         bob.apply_transaction(VecOperation::Push(8));
