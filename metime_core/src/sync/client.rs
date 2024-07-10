@@ -20,8 +20,12 @@ pub struct ClientSync<V: Digestible, T: Transaction<V>, S: ServerApi<V, T>> {
     /// version.
     working_copy: V,
     /// The transactions that were executed onto the basis version to obtain
-    /// `self.working_copy`, along with their corresponding rollback functions.
-    unsynced_transactions: Vec<(T, Rollback<V>)>,
+    /// `self.working_copy`
+    unsynced_transactions: Vec<T>,
+	/// The corresponding rollback functions for each of the unsynced
+	/// transactions. This must always have the same length as
+	/// `self.unsynced_transactions`.
+	rollbacks: Vec<Rollback<V>>,
     /// The sequence number for this client of the first transaction in
     /// `self.unsynced_transactions`.
     sequence_number: u64,
@@ -42,6 +46,7 @@ where
             basis_version_digest,
             working_copy: basis_version,
             unsynced_transactions: Vec::new(),
+			rollbacks: Vec::new(),
             sequence_number,
             server_api,
         }
@@ -58,12 +63,12 @@ where
     /// server's blessed version, the client will request the latest blessed
     /// version from the server, rebase all of our own unsynced transactions to
     /// that version, and attempt to push again.
-    pub async fn synchronize_value(&mut self) {
+    pub async fn synchronize_value(&mut self) -> Result<(), CommunicationError> {
         loop {
             match self
                 .server_api
                 .push_transactions(
-                    self.unsynced_transactions.iter().map(|(forward, _rollback)| forward),
+                    self.unsynced_transactions.iter(),
                     self.basis_version_digest,
                     self.sequence_number,
                 )
@@ -74,7 +79,8 @@ where
                     self.sequence_number +=
                         u64::try_from(self.unsynced_transactions.len()).unwrap();
                     self.unsynced_transactions.clear();
-                    break;
+					self.rollbacks.clear();
+                    return Ok(());
                 }
                 Err(PushError::FastForwardError(FastForwardError::OutdatedBasis)) => {
                     // get our working copy to match the blessed version of the
@@ -88,11 +94,12 @@ where
                             usize::try_from(sequence_number.wrapping_sub(self.sequence_number))
                                 .unwrap();
                         self.unsynced_transactions.drain(..num_pre_synced);
+                        self.rollbacks.drain(..num_pre_synced);
                         self.sequence_number = sequence_number;
 
                         // roll back the transactions that we made, resulting in the
                         // working copy being at the basis version
-                        for (_forward, rollback) in self.unsynced_transactions.iter().rev() {
+                        for rollback in self.rollbacks.iter().rev() {
                             rollback(&mut self.working_copy);
                         }
 
@@ -115,7 +122,7 @@ where
 
                     // attempt to replay our unsynced transactions onto the
                     // blessed version
-                    for (transaction, _rollback) in &self.unsynced_transactions {
+                    for transaction in &self.unsynced_transactions {
                         if let Err(_err) = transaction.execute(&mut self.working_copy) {
                             // the client should decide somehow how to proceed
                             todo!();
@@ -130,7 +137,10 @@ where
                 Err(PushError::FastForwardError(FastForwardError::InvalidTransaction {
                     ..
                 })) => todo!(),
-                Err(PushError::NetworkError) => todo!(),
+                Err(PushError::CommunicationError(err)) => {
+					// assume that our communication did not go through
+					return Err(err);
+				}
             }
         }
     }
@@ -138,12 +148,17 @@ where
     pub fn apply_transaction(&mut self, transaction: T) {
         let rollback =
             transaction.execute(&mut self.working_copy).expect("transactions should be valid");
-        self.unsynced_transactions.push((transaction, rollback));
+        self.unsynced_transactions.push(transaction);
+        self.rollbacks.push(rollback);
     }
 
     pub fn get_working_copy(&self) -> &V {
         &self.working_copy
     }
+
+	pub fn get_unsynced_transactions(&self) -> &[T] {
+		&self.unsynced_transactions
+	}
 }
 
 /// Defines methods that a client can use to communicate with a server.
@@ -180,7 +195,13 @@ pub trait ServerApi<V: Digestible, T: Transaction<V>> {
 pub enum PushError {
     #[error(transparent)]
     FastForwardError(#[from] FastForwardError),
-    // TODO flesh this out
-    #[error("Unable to communicate with the server.")]
-    NetworkError,
+	#[error(transparent)]
+	CommunicationError(#[from] CommunicationError),
+}
+
+#[derive(Error, Debug)]
+pub enum CommunicationError {
+	// TODO flesh this out
+	#[error("Unable to communicate with the server.")]
+	NetworkError,
 }
