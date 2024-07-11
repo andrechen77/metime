@@ -5,11 +5,15 @@ use std::fmt::Debug;
 
 use super::{
     transaction::{self, Rollback, Transaction},
-    FastForwardError,
+    FastForwardError, Steal,
 };
 
 /// Stores a value of type `V` that is synced with a server.
-pub struct ClientSync<V: Digestible, T: Transaction<V>, S: ServerApi<V, T>> {
+pub struct ClientSync<V, S>
+where
+    V: Digestible + Steal<S::DownloadWhole>,
+    S: ServerApi<V>,
+{
     /// A hash of the most recent version of the value obtained from the server,
     /// called the "basis version". This is used to quickly check if this
     /// client's basis version matches the server's blessed version upon
@@ -21,11 +25,11 @@ pub struct ClientSync<V: Digestible, T: Transaction<V>, S: ServerApi<V, T>> {
     working_copy: V,
     /// The transactions that were executed onto the basis version to obtain
     /// `self.working_copy`
-    unsynced_transactions: Vec<T>,
-	/// The corresponding rollback functions for each of the unsynced
-	/// transactions. This must always have the same length as
-	/// `self.unsynced_transactions`.
-	rollbacks: Vec<Rollback<V>>,
+    unsynced_transactions: Vec<S::Tx>,
+    /// The corresponding rollback functions for each of the unsynced
+    /// transactions. This must always have the same length as
+    /// `self.unsynced_transactions`.
+    rollbacks: Vec<Rollback<V>>,
     /// The sequence number for this client of the first transaction in
     /// `self.unsynced_transactions`.
     sequence_number: u64,
@@ -33,11 +37,23 @@ pub struct ClientSync<V: Digestible, T: Transaction<V>, S: ServerApi<V, T>> {
     server_api: S,
 }
 
-impl<V, T, S> ClientSync<V, T, S>
+impl<V, S> ClientSync<V, S>
 where
-    V: Digestible + Debug,
-    T: Transaction<V> + Debug,
-    S: ServerApi<V, T>,
+    V: Digestible + Debug + Steal<S::DownloadWhole>,
+    S: ServerApi<V>,
+    S::DownloadWhole: Into<V>,
+{
+    /// Creates a new `ClientSync` with the server's most recent version.
+    pub async fn with_server_sync(server_api: S) -> Self {
+        let (download, sequence_number) = server_api.download_whole().await;
+        Self::with_basis_version(server_api, download.into(), sequence_number)
+    }
+}
+
+impl<V, S> ClientSync<V, S>
+where
+    V: Digestible + Debug + Steal<S::DownloadWhole>,
+    S: ServerApi<V>,
 {
     /// Creates a new `ClientSync` with the given `basis_version`.
     pub fn with_basis_version(server_api: S, basis_version: V, sequence_number: u64) -> Self {
@@ -46,16 +62,10 @@ where
             basis_version_digest,
             working_copy: basis_version,
             unsynced_transactions: Vec::new(),
-			rollbacks: Vec::new(),
+            rollbacks: Vec::new(),
             sequence_number,
             server_api,
         }
-    }
-
-    /// Creates a new `ClientSync` with the server's most recent version.
-    pub async fn with_server_sync(server_api: S) -> Self {
-        let (basis_version, sequence_number) = server_api.download_whole().await;
-        Self::with_basis_version(server_api, basis_version, sequence_number)
     }
 
     /// Syncs the client with the server, pushing all unsynced transactions. If
@@ -79,7 +89,7 @@ where
                     self.sequence_number +=
                         u64::try_from(self.unsynced_transactions.len()).unwrap();
                     self.unsynced_transactions.clear();
-					self.rollbacks.clear();
+                    self.rollbacks.clear();
                     return Ok(());
                 }
                 Err(PushError::FastForwardError(FastForwardError::OutdatedBasis)) => {
@@ -116,7 +126,7 @@ where
                         let (blessed_version, sequence_number) =
                             self.server_api.download_whole().await;
                         self.sequence_number = sequence_number;
-                        self.working_copy = blessed_version;
+                        self.working_copy.steal(blessed_version);
                         self.basis_version_digest = self.working_copy.digest();
                     }
 
@@ -138,14 +148,14 @@ where
                     ..
                 })) => todo!(),
                 Err(PushError::CommunicationError(err)) => {
-					// assume that our communication did not go through
-					return Err(err);
-				}
+                    // assume that our communication did not go through
+                    return Err(err);
+                }
             }
         }
     }
 
-    pub fn apply_transaction(&mut self, transaction: T) {
+    pub fn apply_transaction(&mut self, transaction: S::Tx) {
         let rollback =
             transaction.execute(&mut self.working_copy).expect("transactions should be valid");
         self.unsynced_transactions.push(transaction);
@@ -156,16 +166,21 @@ where
         &self.working_copy
     }
 
-	pub fn get_unsynced_transactions(&self) -> &[T] {
-		&self.unsynced_transactions
-	}
+    pub fn get_unsynced_transactions(&self) -> &[S::Tx] {
+        &self.unsynced_transactions
+    }
 }
 
 /// Defines methods that a client can use to communicate with a server.
-pub trait ServerApi<V: Digestible, T: Transaction<V>> {
+pub trait ServerApi<V: Digestible + Steal<Self::DownloadWhole>> {
+    /// The type that is returned when the entire value is downloaded from the
+    /// server.
+    type DownloadWhole;
+    type Tx: Transaction<V>;
+
     /// Downloads the most recent version of the value from the server, along
     /// with the next sequence number for this client.
-    async fn download_whole(&self) -> (V, u64);
+    async fn download_whole(&self) -> (Self::DownloadWhole, u64);
 
     /// Downloads the transactions that have been executed since the version
     /// with the given digest, along with the next sequence number for this
@@ -173,7 +188,7 @@ pub trait ServerApi<V: Digestible, T: Transaction<V>> {
     async fn download_transactions_since(
         &self,
         version_digest: DigestOutput,
-    ) -> Option<(Vec<T>, u64)>;
+    ) -> Option<(Vec<Self::Tx>, u64)>;
 
     /// Attempts to push the given transactions to the server. The
     /// interpretation is that the given transactions are executed on the
@@ -183,25 +198,25 @@ pub trait ServerApi<V: Digestible, T: Transaction<V>> {
     /// number must match the next sequence number for this client.
     async fn push_transactions<'a, 'fut>(
         &self,
-        transactions: impl Iterator<Item = &'a T>,
+        transactions: impl Iterator<Item = &'a Self::Tx>,
         basis_vesion_digest: DigestOutput,
         sequence_number: u64,
     ) -> Result<(), PushError>
     where
-        T: 'a;
+        Self::Tx: 'a;
 }
 
 #[derive(Error, Debug)]
 pub enum PushError {
     #[error(transparent)]
     FastForwardError(#[from] FastForwardError),
-	#[error(transparent)]
-	CommunicationError(#[from] CommunicationError),
+    #[error(transparent)]
+    CommunicationError(#[from] CommunicationError),
 }
 
 #[derive(Error, Debug)]
 pub enum CommunicationError {
-	// TODO flesh this out
-	#[error("Unable to communicate with the server.")]
-	NetworkError,
+    // TODO flesh this out
+    #[error("Unable to communicate with the server.")]
+    NetworkError,
 }

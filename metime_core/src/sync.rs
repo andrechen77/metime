@@ -7,6 +7,18 @@ pub mod client;
 pub mod server;
 pub mod transaction;
 
+/// Represents the ability of the self type to "steal" the data of `T`, where
+/// `T` is seen as an alternative representation of the same data.
+pub trait Steal<T> {
+    fn steal(&mut self, other: T);
+}
+
+impl<T> Steal<T> for T {
+    fn steal(&mut self, other: T) {
+        *self = other;
+    }
+}
+
 #[derive(Debug, Eq, PartialEq, Hash, Clone, Copy)]
 pub struct ClientId(u64);
 
@@ -32,7 +44,10 @@ pub enum FastForwardError {
 mod test {
     use super::{client::*, server::*, transaction::*, *};
     use crate::digest::{DigestOutput, Digestible};
-    use std::{cell::{Cell, Ref, RefCell}, vec};
+    use std::{
+        cell::{Cell, Ref, RefCell},
+        vec,
+    };
 
     #[derive(Debug, Clone, PartialEq, Eq, Hash)]
     enum VecOperation {
@@ -86,7 +101,11 @@ mod test {
 
     impl ServerWrapper {
         fn new(server: ServerSync<Vec<u32>, VecOperation>) -> Self {
-            Self { next_client_id: Cell::new(0), num_successes_to_ignore: Cell::new(0), server: RefCell::new(server) }
+            Self {
+                next_client_id: Cell::new(0),
+                num_successes_to_ignore: Cell::new(0),
+                server: RefCell::new(server),
+            }
         }
 
         fn get_handle(&self) -> ServerHandle<'_> {
@@ -141,7 +160,6 @@ mod test {
                         self.num_successes_to_ignore.set(num_successes_to_ignore - 1);
                         Err(PushError::CommunicationError(CommunicationError::NetworkError))
                     }
-
                 }
                 Err(err) => Err(PushError::FastForwardError(err)),
             }
@@ -155,7 +173,10 @@ mod test {
         server: &'handle ServerWrapper,
     }
 
-    impl<'handle> ServerApi<Vec<u32>, VecOperation> for ServerHandle<'handle> {
+    impl<'handle> ServerApi<Vec<u32>> for ServerHandle<'handle> {
+        type DownloadWhole = Vec<u32>;
+        type Tx = VecOperation;
+
         async fn download_whole(&self) -> (Vec<u32>, u64) {
             self.server.download_whole(&self.client_id)
         }
@@ -173,7 +194,12 @@ mod test {
             basis_vesion_digest: DigestOutput,
             sequence_number: u64,
         ) -> Result<(), PushError> {
-            self.server.push_transactions(transactions, basis_vesion_digest, sequence_number, &self.client_id)
+            self.server.push_transactions(
+                transactions,
+                basis_vesion_digest,
+                sequence_number,
+                &self.client_id,
+            )
         }
     }
 
@@ -181,8 +207,7 @@ mod test {
     fn transactions_work() {
         let initial_version = vec![1, 2, 3];
         let server = ServerWrapper::new(ServerSync::new(initial_version.clone()));
-        let mut synced =
-            ClientSync::with_basis_version(server.get_handle(), initial_version, 0);
+        let mut synced = ClientSync::with_basis_version(server.get_handle(), initial_version, 0);
         assert_eq!(synced.get_working_copy(), &vec![1, 2, 3]);
         synced.apply_transaction(VecOperation::Push(4));
         synced.apply_transaction(VecOperation::Push(5));
@@ -206,8 +231,7 @@ mod test {
     #[tokio::test]
     async fn invalid_initial_value_is_corrected() {
         let server = ServerWrapper::new(ServerSync::new(vec![1, 2, 3]));
-        let mut synced =
-            ClientSync::with_basis_version(server.get_handle(), vec![11, 22, 33], 0);
+        let mut synced = ClientSync::with_basis_version(server.get_handle(), vec![11, 22, 33], 0);
         assert_eq!(synced.get_working_copy(), &vec![11, 22, 33]);
         synced.apply_transaction(VecOperation::Push(4));
         synced.apply_transaction(VecOperation::Push(5));
@@ -270,7 +294,10 @@ mod test {
 
         assert_eq!(*server.get_blessed(), vec![1, 2, 3, 4, 5]);
         assert_eq!(*client.get_working_copy(), vec![1, 2, 3, 4, 5]);
-        assert_eq!(client.get_unsynced_transactions(), &[VecOperation::Push(4), VecOperation::Push(5)]);
+        assert_eq!(
+            client.get_unsynced_transactions(),
+            &[VecOperation::Push(4), VecOperation::Push(5)]
+        );
 
         client.apply_transaction(VecOperation::Push(6));
         client.synchronize_value().await.unwrap();
