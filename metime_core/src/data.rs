@@ -113,7 +113,7 @@ pub struct IcalRecurrenceDesc {
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
-pub struct CategoriesTable {
+struct CategoriesTable {
     categories: HashMap<CategoryId, CategoryData>,
 }
 
@@ -209,7 +209,7 @@ impl Database {
     /// of segments. Fails if there is already a segment that includes the
     /// specified date-time. Returns whether a segment was successfully
     /// prepended.
-    fn prepend_segment(&mut self, start: DateTime<Utc>) -> bool {
+    pub fn prepend_segment(&mut self, start: DateTime<Utc>) -> bool {
         if let Some(segment) = self.segments.first() {
             if segment.start <= start {
                 // there is already a segment that includes the specified

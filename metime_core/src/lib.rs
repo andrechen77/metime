@@ -1,3 +1,3 @@
-mod data;
+pub mod data;
 mod digest;
 mod sync;
