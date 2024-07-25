@@ -34,41 +34,45 @@ pub struct Segment {
 #[derive(Debug, PartialEq, Eq, Hash, Copy, Clone)]
 pub struct EventSetId(u64);
 
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone, Default)]
 pub struct EventSetData {
-    records: Vec<EventRecord>,
+    overrides: Vec<OverrideInstance>,
+    enumerated_instances: Vec<EnumeratedInstances>,
+    ical_recurring_instances: Vec<IcalRecurringInstances>,
 }
 
+/// Enumerates a finite set of instances in the event set.
 #[derive(Debug, PartialEq, Eq, Clone)]
-pub enum EventRecord {
-    /// Enumerates a finite set of instances in the event set.
-    EnumeratedInstances {
-        /// The periods of the instances of the event. The start times of the
-        /// periods must be monotonically increasing. Must be non-empty.
-        periods: Vec<Period>,
-        event_data: EventDataTimeless,
-    },
-    /// Defines a possibly infinite set of instances in the event set based on
-    /// an iCalendar (RFC 5545) recurrence rule.
-    IcalRecurringInstances {
-        reccurence_desc: IcalRecurrenceDesc,
-        event_data: EventDataTimeless,
-    },
-    /// Overrides an existing instancein the event set possibly rescheduling or
-    /// deleting them. May also edit the data of the overrided instance.
-    OverrideInstance {
-        /// The target instance to override. Must refer to an existing instance
-        /// of an event in the event set; cannot refer to the result of
-        /// overriding an instance.
-        target: Moment,
-        /// The new period of the overriden instance. If this is None, the
-        /// instance is deleted.
-        new_period: Option<Period>,
-        /// The new data of the overriden instance. If this is None, the
-        /// instance retains its original data. Meaningless if new_period is
-        /// None.
-        event_data: Option<EventDataTimeless>,
-    },
+struct EnumeratedInstances {
+    /// The periods of the instances of the event. The start times of the
+    /// periods must be monotonically increasing. Must be non-empty.
+    periods: Vec<Period>,
+    event_data: EventDataTimeless,
+}
+
+/// Defines a possibly infinite set of instances in the event set based on
+/// an iCalendar (RFC 5545) recurrence rule.
+#[derive(Debug, PartialEq, Eq, Clone)]
+struct IcalRecurringInstances {
+    reccurence_desc: IcalRecurrenceDesc,
+    event_data: EventDataTimeless,
+}
+
+/// Overrides an existing instancein the event set possibly rescheduling or
+/// deleting them. May also edit the data of the overrided instance.
+#[derive(Debug, PartialEq, Eq, Clone)]
+struct OverrideInstance {
+    /// The target instance to override. Must refer to an existing instance
+    /// of an event in the event set; cannot refer to the result of
+    /// overriding an instance.
+    target: Moment,
+    /// The new period of the overriden instance. If this is None, the
+    /// instance is deleted.
+    new_period: Option<Period>,
+    /// The new data of the overriden instance. If this is None, the
+    /// instance retains its original data. Meaningless if new_period is
+    /// None.
+    event_data: Option<EventDataTimeless>,
 }
 
 #[derive(Debug, Default, PartialEq, Eq, Clone)]
@@ -194,10 +198,13 @@ impl Database {
             if num_additional_segments == 0 {
                 return false;
             }
-            self.segments.splice(0..0, (0..num_additional_segments).map(|i| Segment {
-                start: first_start_time + DEFAULT_SEGMENT_SIZE * i,
-                events: Vec::new(),
-            }));
+            self.segments.splice(
+                0..0,
+                (0..num_additional_segments).map(|i| Segment {
+                    start: first_start_time + DEFAULT_SEGMENT_SIZE * i,
+                    events: Vec::new(),
+                }),
+            );
             true
         } else {
             self.segments.push(Segment { start: earliest, events: Vec::new() });
@@ -236,9 +243,9 @@ impl Database {
         let mut iter = self.segments.iter().enumerate().rev();
 
         // get the index of the latest segment that overlaps with the interval
-        let Some(last_index) = iter.find_map(|(index, segment)| {
-            if segment.start < end { Some(index) } else { None }
-        }) else {
+        let Some(last_index) =
+            iter.find_map(|(index, segment)| if segment.start < end { Some(index) } else { None })
+        else {
             // the interval ends before the earliest segment begins
             return &[];
         };
@@ -268,6 +275,10 @@ impl EventSetData {
     /// instances of the event set, and a date-time after which it is guaranteed
     /// that there are no instances of the event set. This includes the end
     /// times of event instances.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the event set has no instances.
     fn pessimistic_boundaries(&self) -> (DateTime<Utc>, Option<DateTime<Utc>>) {
         // None means there have been no instances yet to set any of the limits.
         // Some(limit) means that `limit` is the latest time that an instance of
@@ -304,45 +315,43 @@ impl EventSetData {
             };
         }
 
-        'record_loop: for record in &self.records {
-            match record {
-                EventRecord::EnumeratedInstances { periods, .. } => {
-                    for period in periods {
-                        let (start, end) = period.pessimistic_boundaries();
-                        expand_limits(&mut earliest, &mut latest, start, Some(end));
-                    }
-                }
-                EventRecord::IcalRecurringInstances { reccurence_desc, .. } => {
-                    let IcalRecurrenceDesc { initial_recurrence, rrule } = reccurence_desc;
+        for EnumeratedInstances { periods, .. } in self.enumerated_instances.iter() {
+            for period in periods {
+                let (start, end) = period.pessimistic_boundaries();
+                expand_limits(&mut earliest, &mut latest, start, Some(end));
+            }
+        }
+        for IcalRecurringInstances { reccurence_desc, .. } in self.ical_recurring_instances.iter() {
+            let IcalRecurrenceDesc { initial_recurrence, rrule } = reccurence_desc;
 
-                    // find the start point of the recurrence
-                    let start = initial_recurrence.pessimistic_boundaries().0;
+            // find the start point of the recurrence
+            let start = initial_recurrence.pessimistic_boundaries().0;
 
-                    // find the end point of the recurrence
-                    let end = if let Some(until) = rrule.get_until() {
-                        // the recurrence rule defines a set end point
-                        let last = initial_recurrence.shift_start_coerce(until.to_utc());
-                        Some(last.pessimistic_boundaries().1)
-                    } else if rrule.get_count().is_some() {
-                        // the recurrence rule defines a set number of instances
-                        let Some(end) = reccurence_desc.into_iter().last().map(|last| last.pessimistic_boundaries().1) else {
-                            // the recurrence rule defines no instances
-                            continue 'record_loop;
-                        };
-                        Some(end)
-                    } else {
-                        // the recurrence rule defines no end to instances
-                        None
-                    };
+            // find the end point of the recurrence
+            let end = if let Some(until) = rrule.get_until() {
+                // the recurrence rule defines a set end point
+                let last = initial_recurrence.shift_start_coerce(until.to_utc());
+                Some(last.pessimistic_boundaries().1)
+            } else if rrule.get_count().is_some() {
+                // the recurrence rule defines a set number of instances
+                let Some(end) =
+                    reccurence_desc.into_iter().last().map(|last| last.pessimistic_boundaries().1)
+                else {
+                    // the recurrence rule defines no instances
+                    continue;
+                };
+                Some(end)
+            } else {
+                // the recurrence rule defines no end to instances
+                None
+            };
 
-                    expand_limits(&mut earliest, &mut latest, start, end);
-                }
-                EventRecord::OverrideInstance { new_period, .. } => {
-                    if let Some(new_period) = new_period {
-                        let (start, end) = new_period.pessimistic_boundaries();
-                        expand_limits(&mut earliest, &mut latest, start, Some(end));
-                    }
-                }
+            expand_limits(&mut earliest, &mut latest, start, end);
+        }
+        for OverrideInstance { new_period, .. } in self.overrides.iter() {
+            if let Some(new_period) = new_period {
+                let (start, end) = new_period.pessimistic_boundaries();
+                expand_limits(&mut earliest, &mut latest, start, Some(end));
             }
         }
 
@@ -364,7 +373,8 @@ impl Period {
             &Period::DateTime(dt) => (dt, dt),
             &Period::DateInterval { start, additional } => {
                 let start_point = Utc.from_utc_datetime(&start.and_time(NaiveTime::MIN));
-                let end_point = Utc.from_utc_datetime(&(start + additional).and_time(NaiveTime::MIN));
+                let end_point =
+                    Utc.from_utc_datetime(&(start + additional).and_time(NaiveTime::MIN));
                 // for the earliest time, subtract 14 hours to be safe, since it
                 // could still be that date if it is the start of the day with a
                 // +14:00 offset. for the latest time, add one day and 12 hours
@@ -386,9 +396,7 @@ impl Period {
             (Period::DateTimeInterval { start, end }, Moment::DateTime(new_start)) => {
                 Some(Period::DateTimeInterval { start: new_start, end: new_start + (*end - start) })
             }
-            (Period::DateTime(_), Moment::DateTime(new_start)) => {
-                Some(Period::DateTime(new_start))
-            }
+            (Period::DateTime(_), Moment::DateTime(new_start)) => Some(Period::DateTime(new_start)),
             (Period::DateInterval { start: _, additional }, Moment::Date(new_start)) => {
                 Some(Period::DateInterval { start: new_start, additional: *additional })
             }
@@ -403,7 +411,8 @@ impl Period {
             Period::DateTimeInterval { .. } | Period::DateTime(_) => Moment::DateTime(new_start),
             Period::DateInterval { .. } => Moment::Date(new_start.date_naive()),
         };
-        self.shift_start(new_start).expect("made sure that the initial recurrence and the new start are compatible")
+        self.shift_start(new_start)
+            .expect("made sure that the initial recurrence and the new start are compatible")
     }
 
     // Returns the `Moment` at which the `Period` starts.
@@ -433,10 +442,10 @@ impl Moment {
 mod recurrence_iter {
     use std::rc::Rc;
 
-    use rrule::{RRuleSet, RRuleSetIter};
     use chrono::TimeZone;
+    use rrule::{RRuleSet, RRuleSetIter};
 
-    use super::{IcalRecurrenceDesc, Moment, Period};
+    use super::{IcalRecurrenceDesc, Period};
 
     pub struct IcalRecurrenceIter {
         initial_recurrence: Period,
@@ -453,9 +462,7 @@ mod recurrence_iter {
         type Item = Period;
 
         fn next(&mut self) -> Option<Self::Item> {
-            self.rrule_iter.next().map(|dt| {
-                self.initial_recurrence.shift_start_coerce(dt.to_utc())
-            })
+            self.rrule_iter.next().map(|dt| self.initial_recurrence.shift_start_coerce(dt.to_utc()))
         }
     }
 
@@ -484,9 +491,8 @@ mod recurrence_iter {
             // will live together and have the same lifetime. Thus, the
             // internals of RRuleSetIter will always point to valid data, and
             // can be tricked into thinking the data is 'static.
-            let rrule_iter: RRuleSetIter<'static> = unsafe {
-                &*(rrule_set.as_ref() as *const RRuleSet)
-            }.into_iter();
+            let rrule_iter: RRuleSetIter<'static> =
+                unsafe { &*(rrule_set.as_ref() as *const RRuleSet) }.into_iter();
 
             IcalRecurrenceIter {
                 initial_recurrence: *initial_recurrence,
@@ -506,10 +512,7 @@ mod recurrence_iter {
         #[test]
         fn generates_dt_periods() {
             fn gen_period(start: DateTime<Utc>) -> Period {
-                Period::DateTimeInterval {
-                    start,
-                    end: start + Duration::hours(1),
-                }
+                Period::DateTimeInterval { start, end: start + Duration::hours(1) }
             }
 
             let dt_start = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
@@ -523,20 +526,20 @@ mod recurrence_iter {
             };
 
             let dates = rrule.into_iter().collect::<Vec<_>>();
-            assert_eq!(dates, vec![
-                gen_period(Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap()),
-                gen_period(Utc.with_ymd_and_hms(2024, 1, 3, 0, 0, 0).unwrap()),
-                gen_period(Utc.with_ymd_and_hms(2024, 1, 5, 0, 0, 0).unwrap()),
-            ]);
+            assert_eq!(
+                dates,
+                vec![
+                    gen_period(Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap()),
+                    gen_period(Utc.with_ymd_and_hms(2024, 1, 3, 0, 0, 0).unwrap()),
+                    gen_period(Utc.with_ymd_and_hms(2024, 1, 5, 0, 0, 0).unwrap()),
+                ]
+            );
         }
 
         #[test]
         fn generates_date_periods() {
             fn gen_period(start: NaiveDate) -> Period {
-                Period::DateInterval {
-                    start,
-                    additional: Days::new(1),
-                }
+                Period::DateInterval { start, additional: Days::new(1) }
             }
 
             let dt_start = NaiveDate::from_ymd_opt(2024, 1, 1).unwrap();
@@ -550,11 +553,14 @@ mod recurrence_iter {
             };
 
             let dates = rrule.into_iter().collect::<Vec<_>>();
-            assert_eq!(dates, vec![
-                gen_period(NaiveDate::from_ymd_opt(2024, 1, 1).unwrap()),
-                gen_period(NaiveDate::from_ymd_opt(2024, 1, 3).unwrap()),
-                gen_period(NaiveDate::from_ymd_opt(2024, 1, 5).unwrap()),
-            ]);
+            assert_eq!(
+                dates,
+                vec![
+                    gen_period(NaiveDate::from_ymd_opt(2024, 1, 1).unwrap()),
+                    gen_period(NaiveDate::from_ymd_opt(2024, 1, 3).unwrap()),
+                    gen_period(NaiveDate::from_ymd_opt(2024, 1, 5).unwrap()),
+                ]
+            );
         }
     }
 }
@@ -569,10 +575,7 @@ mod test {
     fn period_pessimistic_boundaries() {
         let a = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
 
-        let dt_interval = Period::DateTimeInterval {
-            start: a,
-            end: a + Duration::hours(1),
-        };
+        let dt_interval = Period::DateTimeInterval { start: a, end: a + Duration::hours(1) };
         assert_eq!(dt_interval.pessimistic_boundaries(), (a, a + Duration::hours(1)));
 
         let dt_point = Period::DateTime(a);
@@ -583,8 +586,14 @@ mod test {
             additional: Days::new(2),
         };
         let (bound_left, bound_right) = date_interval.pessimistic_boundaries();
-        assert_eq!(bound_left, Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap() - Duration::hours(14));
-        assert_eq!(bound_right, Utc.with_ymd_and_hms(2024, 1, 4, 0, 0, 0).unwrap() + Duration::hours(12));
+        assert_eq!(
+            bound_left,
+            Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap() - Duration::hours(14)
+        );
+        assert_eq!(
+            bound_right,
+            Utc.with_ymd_and_hms(2024, 1, 4, 0, 0, 0).unwrap() + Duration::hours(12)
+        );
     }
 
     #[test]
@@ -594,41 +603,31 @@ mod test {
             reference + Duration::days(offset_days)
         }
 
-        let event_set = EventSetData { records: vec![
-            EventRecord::EnumeratedInstances {
+        let event_set = EventSetData {
+            enumerated_instances: vec![EnumeratedInstances {
                 periods: vec![
-                    Period::DateTimeInterval {
-                        start: gen_dt(0),
-                        end: gen_dt(3),
-                    },
-                    Period::DateTimeInterval {
-                        start: gen_dt(1),
-                        end: gen_dt(2),
-                    },
+                    Period::DateTimeInterval { start: gen_dt(0), end: gen_dt(3) },
+                    Period::DateTimeInterval { start: gen_dt(1), end: gen_dt(2) },
                 ],
                 event_data: EventDataTimeless::default(),
-            },
-        ] };
+            }],
+            ..Default::default()
+        };
         let (earliest, latest) = event_set.pessimistic_boundaries();
         assert_eq!(earliest, gen_dt(0));
         assert_eq!(latest, Some(gen_dt(3)));
 
-        let event_set = EventSetData { records: vec![
-            EventRecord::EnumeratedInstances {
+        let event_set = EventSetData {
+            enumerated_instances: vec![EnumeratedInstances {
                 periods: vec![
-                    Period::DateTimeInterval {
-                        start: gen_dt(0),
-                        end: gen_dt(3),
-                    },
+                    Period::DateTimeInterval { start: gen_dt(0), end: gen_dt(3) },
                     Period::DateTime(gen_dt(4)),
-                    Period::DateTimeInterval {
-                        start: gen_dt(1),
-                        end: gen_dt(2),
-                    },
+                    Period::DateTimeInterval { start: gen_dt(1), end: gen_dt(2) },
                 ],
                 event_data: EventDataTimeless::default(),
-            },
-        ]};
+            }],
+            ..Default::default()
+        };
         let (earliest, latest) = event_set.pessimistic_boundaries();
         assert_eq!(earliest, gen_dt(0));
         assert_eq!(latest, Some(gen_dt(4)));
@@ -649,12 +648,13 @@ mod test {
                 .unwrap(),
         };
 
-        let event_set = EventSetData { records: vec![
-            EventRecord::IcalRecurringInstances {
+        let event_set = EventSetData {
+            ical_recurring_instances: vec![IcalRecurringInstances {
                 reccurence_desc: rrule,
                 event_data: EventDataTimeless::default(),
-            },
-        ] };
+            }],
+            ..Default::default()
+        };
 
         let (earliest, latest) = event_set.pessimistic_boundaries();
         assert_eq!(earliest, dt_start);
@@ -677,12 +677,13 @@ mod test {
                 .unwrap(),
         };
 
-        let event_set = EventSetData { records: vec![
-            EventRecord::IcalRecurringInstances {
+        let event_set = EventSetData {
+            ical_recurring_instances: vec![IcalRecurringInstances {
                 reccurence_desc: rrule,
                 event_data: EventDataTimeless::default(),
-            },
-        ] };
+            }],
+            ..Default::default()
+        };
 
         let (earliest, latest) = event_set.pessimistic_boundaries();
         assert_eq!(earliest, dt_start);
@@ -703,12 +704,13 @@ mod test {
                 .unwrap(),
         };
 
-        let event_set = EventSetData { records: vec![
-            EventRecord::IcalRecurringInstances {
+        let event_set = EventSetData {
+            ical_recurring_instances: vec![IcalRecurringInstances {
                 reccurence_desc: rrule,
                 event_data: EventDataTimeless::default(),
-            },
-        ] };
+            }],
+            ..Default::default()
+        };
 
         let (earliest, latest) = event_set.pessimistic_boundaries();
         assert_eq!(earliest, dt_start);
@@ -722,21 +724,15 @@ mod test {
             reference + Duration::days(offset_days)
         }
 
-        let event_set = EventSetData { records: vec![
-            EventRecord::EnumeratedInstances {
+        let event_set = EventSetData {
+            enumerated_instances: vec![EnumeratedInstances {
                 periods: vec![
-                    Period::DateTimeInterval {
-                        start: gen_dt(0),
-                        end: gen_dt(3),
-                    },
-                    Period::DateTimeInterval {
-                        start: gen_dt(1),
-                        end: gen_dt(2),
-                    },
+                    Period::DateTimeInterval { start: gen_dt(0), end: gen_dt(3) },
+                    Period::DateTimeInterval { start: gen_dt(1), end: gen_dt(2) },
                 ],
                 event_data: EventDataTimeless::default(),
-            },
-            EventRecord::IcalRecurringInstances {
+            }],
+            ical_recurring_instances: vec![IcalRecurringInstances {
                 reccurence_desc: IcalRecurrenceDesc {
                     initial_recurrence: Period::DateTimeInterval {
                         start: gen_dt(2),
@@ -749,9 +745,13 @@ mod test {
                         .unwrap(),
                 },
                 event_data: EventDataTimeless::default(),
-            },
-            EventRecord::OverrideInstance { target: Moment::DateTime(gen_dt(0)), new_period: Some(Period::DateTimeInterval { start: gen_dt(-5), end: gen_dt(-4) }), event_data: Default::default() },
-        ] };
+            }],
+            overrides: vec![OverrideInstance {
+                target: Moment::DateTime(gen_dt(0)),
+                new_period: Some(Period::DateTimeInterval { start: gen_dt(-5), end: gen_dt(-4) }),
+                event_data: Default::default(),
+            }],
+        };
 
         let (earliest, latest) = event_set.pessimistic_boundaries();
         assert_eq!(earliest, gen_dt(-5));
@@ -764,9 +764,10 @@ mod test {
 
         let mut db = Database::new();
         assert!(db.prepend_segment(dt));
-        assert_eq!(db.segments().collect::<Vec<_>>(), vec![
-            &Segment { start: dt, events: Vec::new() },
-        ]);
+        assert_eq!(
+            db.segments().collect::<Vec<_>>(),
+            vec![&Segment { start: dt, events: Vec::new() },]
+        );
     }
 
     #[test]
@@ -775,16 +776,20 @@ mod test {
 
         let dt = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
         assert!(db.ensure_segments_back_to(dt));
-        assert_eq!(db.segments().collect::<Vec<_>>(), vec![
-            &Segment { start: dt, events: Vec::new() },
-        ]);
+        assert_eq!(
+            db.segments().collect::<Vec<_>>(),
+            vec![&Segment { start: dt, events: Vec::new() },]
+        );
 
         let dt2 = Utc.with_ymd_and_hms(2023, 12, 31, 0, 0, 0).unwrap();
         assert!(db.ensure_segments_back_to(dt2));
-        assert_eq!(db.segments().collect::<Vec<_>>(), vec![
-            &Segment { start: dt - DEFAULT_SEGMENT_SIZE, events: Vec::new() },
-            &Segment { start: dt, events: Vec::new() },
-        ]);
+        assert_eq!(
+            db.segments().collect::<Vec<_>>(),
+            vec![
+                &Segment { start: dt - DEFAULT_SEGMENT_SIZE, events: Vec::new() },
+                &Segment { start: dt, events: Vec::new() },
+            ]
+        );
 
         // dt3 is already included, so it should not add any other segments
         let dt3 = Utc.with_ymd_and_hms(2022, 12, 30, 0, 0, 0).unwrap();
@@ -792,11 +797,14 @@ mod test {
 
         let dt4 = Utc.with_ymd_and_hms(2022, 1, 30, 0, 0, 0).unwrap();
         assert!(db.ensure_segments_back_to(dt4));
-        assert_eq!(db.segments().collect::<Vec<_>>(), vec![
-            &Segment { start: dt - DEFAULT_SEGMENT_SIZE * 2, events: Vec::new() },
-            &Segment { start: dt - DEFAULT_SEGMENT_SIZE, events: Vec::new() },
-            &Segment { start: dt, events: Vec::new() },
-        ]);
+        assert_eq!(
+            db.segments().collect::<Vec<_>>(),
+            vec![
+                &Segment { start: dt - DEFAULT_SEGMENT_SIZE * 2, events: Vec::new() },
+                &Segment { start: dt - DEFAULT_SEGMENT_SIZE, events: Vec::new() },
+                &Segment { start: dt, events: Vec::new() },
+            ]
+        );
     }
 
     #[test]
@@ -806,17 +814,19 @@ mod test {
 
         let mut db = Database::new();
 
-        let event_set = EventSetData { records: vec![
-            EventRecord::EnumeratedInstances {
+        let event_set = EventSetData {
+            enumerated_instances: vec![EnumeratedInstances {
                 periods: vec![Period::DateTimeInterval { start: a, end: b }],
                 event_data: EventDataTimeless::default(),
-            },
-        ] };
+            }],
+            ..Default::default()
+        };
 
         let id = db.add_event_set(event_set.clone());
-        assert_eq!(db.segments().collect::<Vec<_>>(), vec![
-            &Segment { start: a, events: vec![id] },
-        ]);
+        assert_eq!(
+            db.segments().collect::<Vec<_>>(),
+            vec![&Segment { start: a, events: vec![id] },]
+        );
         assert_eq!(db.get_event_set(&id), Some(&event_set));
     }
 
@@ -829,12 +839,13 @@ mod test {
         fn gen_event_set(start_offset_days: i64, end_offset_days: i64) -> EventSetData {
             let a = gen_dt(start_offset_days);
             let b = gen_dt(end_offset_days);
-            EventSetData { records: vec![
-                EventRecord::EnumeratedInstances {
+            EventSetData {
+                enumerated_instances: vec![EnumeratedInstances {
                     periods: vec![Period::DateTimeInterval { start: a, end: b }],
                     event_data: EventDataTimeless::default(),
-                },
-            ] }
+                }],
+                ..Default::default()
+            }
         }
 
         let mut db = Database::new();
@@ -844,38 +855,47 @@ mod test {
         assert!(db.prepend_segment(gen_dt(200)));
         assert!(db.prepend_segment(gen_dt(100)));
         assert!(db.prepend_segment(gen_dt(0)));
-        assert_eq!(db.segments().collect::<Vec<_>>(), vec![
-            &Segment { start: gen_dt(0), events: Vec::new() },
-            &Segment { start: gen_dt(100), events: Vec::new() },
-            &Segment { start: gen_dt(200), events: Vec::new() },
-            &Segment { start: gen_dt(300), events: Vec::new() },
-            &Segment { start: gen_dt(400), events: Vec::new() },
-            &Segment { start: gen_dt(500), events: Vec::new() },
-        ]);
+        assert_eq!(
+            db.segments().collect::<Vec<_>>(),
+            vec![
+                &Segment { start: gen_dt(0), events: Vec::new() },
+                &Segment { start: gen_dt(100), events: Vec::new() },
+                &Segment { start: gen_dt(200), events: Vec::new() },
+                &Segment { start: gen_dt(300), events: Vec::new() },
+                &Segment { start: gen_dt(400), events: Vec::new() },
+                &Segment { start: gen_dt(500), events: Vec::new() },
+            ]
+        );
 
         let id_a = db.add_event_set(gen_event_set(150, 350));
         let id_b = db.add_event_set(gen_event_set(250, 251));
         let id_c = db.add_event_set(gen_event_set(300, 450));
         let id_d = db.add_event_set(gen_event_set(350, 500));
         let id_e = db.add_event_set(gen_event_set(450, 550));
-        assert_eq!(db.segments().collect::<Vec<_>>(), vec![
-            &Segment { start: gen_dt(0), events: vec![] },
-            &Segment { start: gen_dt(100), events: vec![id_a] },
-            &Segment { start: gen_dt(200), events: vec![id_a, id_b] },
-            &Segment { start: gen_dt(300), events: vec![id_a, id_c, id_d] },
-            &Segment { start: gen_dt(400), events: vec![id_c, id_d, id_e] },
-            &Segment { start: gen_dt(500), events: vec![id_d, id_e] },
-        ]);
+        assert_eq!(
+            db.segments().collect::<Vec<_>>(),
+            vec![
+                &Segment { start: gen_dt(0), events: vec![] },
+                &Segment { start: gen_dt(100), events: vec![id_a] },
+                &Segment { start: gen_dt(200), events: vec![id_a, id_b] },
+                &Segment { start: gen_dt(300), events: vec![id_a, id_c, id_d] },
+                &Segment { start: gen_dt(400), events: vec![id_c, id_d, id_e] },
+                &Segment { start: gen_dt(500), events: vec![id_d, id_e] },
+            ]
+        );
 
         let id_f = db.add_event_set(gen_event_set(-1, 50));
-        assert_eq!(db.segments().collect::<Vec<_>>(), vec![
-            &Segment { start: gen_dt(0) - DEFAULT_SEGMENT_SIZE, events: vec![id_f] },
-            &Segment { start: gen_dt(0), events: vec![id_f] },
-            &Segment { start: gen_dt(100), events: vec![id_a] },
-            &Segment { start: gen_dt(200), events: vec![id_a, id_b] },
-            &Segment { start: gen_dt(300), events: vec![id_a, id_c, id_d] },
-            &Segment { start: gen_dt(400), events: vec![id_c, id_d, id_e] },
-            &Segment { start: gen_dt(500), events: vec![id_d, id_e] },
-        ]);
+        assert_eq!(
+            db.segments().collect::<Vec<_>>(),
+            vec![
+                &Segment { start: gen_dt(0) - DEFAULT_SEGMENT_SIZE, events: vec![id_f] },
+                &Segment { start: gen_dt(0), events: vec![id_f] },
+                &Segment { start: gen_dt(100), events: vec![id_a] },
+                &Segment { start: gen_dt(200), events: vec![id_a, id_b] },
+                &Segment { start: gen_dt(300), events: vec![id_a, id_c, id_d] },
+                &Segment { start: gen_dt(400), events: vec![id_c, id_d, id_e] },
+                &Segment { start: gen_dt(500), events: vec![id_d, id_e] },
+            ]
+        );
     }
 }
