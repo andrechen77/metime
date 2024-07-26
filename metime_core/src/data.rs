@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, rc::Rc};
 
 use chrono::{DateTime, Days, Duration, NaiveDate, NaiveTime, TimeZone, Utc};
 
@@ -66,26 +66,23 @@ struct OverrideInstance {
     /// of an event in the event set; cannot refer to the result of
     /// overriding an instance.
     target: Moment,
-    /// The new period of the overriden instance. If this is None, the
-    /// instance is deleted.
-    new_period: Option<Period>,
-    /// The new data of the overriden instance. If this is None, the
-    /// instance retains its original data. Meaningless if new_period is
-    /// None.
-    event_data: Option<EventDataTimeless>,
+    /// The overriden instance's period and event data. If this is None, the
+    /// instance is deleted. If only the event data is None, then the instance
+    /// retains its original data.
+    new_instance: Option<(Period, Option<EventDataTimeless>)>,
 }
 
 #[derive(Debug, Default, PartialEq, Eq, Clone)]
 pub struct EventDataTimeless {
     /// The categories to which this event belongs.
-    categories: Vec<CategoryId>,
+    pub categories: Vec<CategoryId>,
     /// A short description of the event, e.g. "weekly meeting with John".
-    summary: String,
+    pub summary: String,
     /// A longer description of the event.
-    description: String,
+    pub description: String,
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub enum Moment {
     DateTime(DateTime<Utc>),
     Date(NaiveDate),
@@ -106,6 +103,12 @@ pub enum Period {
     /// if the start date is 2024-01-01 and there are 2 additional days, the
     /// last day of the period will *include* 2024-01-03, for 3 days in total.
     DateInterval { start: NaiveDate, additional: Days },
+}
+
+/// Representation of the data for a particular event instance.
+pub struct EventInstance {
+    pub period: Period,
+    pub data: EventDataTimeless,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -348,8 +351,8 @@ impl EventSetData {
 
             expand_limits(&mut earliest, &mut latest, start, end);
         }
-        for OverrideInstance { new_period, .. } in self.overrides.iter() {
-            if let Some(new_period) = new_period {
+        for OverrideInstance { new_instance, .. } in self.overrides.iter() {
+            if let Some((new_period, _)) = new_instance {
                 let (start, end) = new_period.pessimistic_boundaries();
                 expand_limits(&mut earliest, &mut latest, start, Some(end));
             }
@@ -359,6 +362,94 @@ impl EventSetData {
             earliest.expect("should be at least one record in the event set"),
             latest.expect("shoudl be at least one record in the event set"),
         )
+    }
+
+    /// Returns an iterator over all instances of the event set that are in the
+    /// specified interval. The instances are not necessarily returned in the
+    /// order of their start time.
+    pub fn get_instances_in_interval(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> impl Iterator<Item = EventInstance> + '_ {
+        let EventSetData { overrides, enumerated_instances, ical_recurring_instances } = self;
+
+        let overrides: Rc<HashMap<_, _>> = Rc::new(HashMap::from_iter(overrides.iter().map(
+            |OverrideInstance { target, new_instance: new_period }| {
+                (target.clone(), new_period.clone())
+            },
+        )));
+        // converts a period into an EventInstance, taking in to account
+        // possible overrides
+        fn maybe_override(
+            period: &Period,
+            original_event_data: &EventDataTimeless,
+            overrides: &HashMap<Moment, Option<(Period, Option<EventDataTimeless>)>>,
+        ) -> Option<EventInstance> {
+            if let Some(new_instance) = overrides.get(&period.start()) {
+                if let Some((new_period, new_data)) = new_instance {
+                    Some(EventInstance {
+                        period: *new_period,
+                        data: new_data.as_ref().cloned().unwrap_or(original_event_data.clone()),
+                    })
+                } else {
+                    // this instance was deleted
+                    None
+                }
+            } else {
+                Some(EventInstance { period: *period, data: original_event_data.clone() })
+            }
+        }
+
+        let overrides_too = overrides.clone();
+        let enumerated = enumerated_instances.iter().flat_map(
+            move |EnumeratedInstances { periods, event_data }| {
+                let overrides_too = overrides_too.clone();
+                periods
+                    .iter()
+                    // filter out eligible periods
+                    .filter_map(move |period| {
+                        let (earliest, latest) = period.pessimistic_boundaries();
+                        if earliest > end {
+                            // no other instance after this one can possibly
+                            // be within the interval because they are
+                            // sorted by start time
+                            return None;
+                        }
+                        if latest >= start {
+                            return Some(Some(period));
+                        } else {
+                            // this instance is before the interval, but
+                            // later instances might still be within the
+                            // interval
+                            return Some(None);
+                        }
+                    })
+                    // stop iteration on the first event that is after the interval;
+                    // this is a performance operation to stop looking for eligible
+                    // instances after we are already past the interval
+                    .fuse()
+                    // eliminate the `Some(None)` cases from above, while also
+                    // accounting for overridden events
+                    .filter_map(move |maybe_period| {
+                        maybe_period.and_then(|period| {
+                            maybe_override(period, event_data, overrides_too.as_ref())
+                        })
+                    })
+            },
+        );
+
+        let overrides_too = overrides.clone();
+        let recurring = ical_recurring_instances.iter().flat_map(
+            move |IcalRecurringInstances { reccurence_desc, event_data }| {
+                let overrides_too = overrides_too.clone();
+                reccurence_desc.get_all_instances_in_interval(start, end).filter_map(
+                    move |period| maybe_override(&period, event_data, overrides_too.as_ref()),
+                )
+            },
+        );
+
+        recurring.chain(enumerated)
     }
 }
 
@@ -437,12 +528,39 @@ impl Moment {
     }
 }
 
+impl IcalRecurrenceDesc {
+    pub fn get_all_instances_in_interval(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> impl Iterator<Item = Period> + '_ {
+        let start = rrule::Tz::Tz(chrono_tz::UTC).from_utc_datetime(&start.naive_utc());
+        let end = rrule::Tz::Tz(chrono_tz::UTC).from_utc_datetime(&end.naive_utc());
+        let rrule_set = self.to_rrule_set().after(start).before(end);
+        let rrule::RRuleResult { dates, limited: true } = rrule_set.all(u16::MAX) else {
+            panic!("there are way too many event instances to handle here");
+        };
+        dates.into_iter().map(|dt| self.initial_recurrence.shift_start_coerce(dt.to_utc()))
+    }
+
+    pub fn to_rrule_set(&self) -> rrule::RRuleSet {
+        let IcalRecurrenceDesc { initial_recurrence, rrule } = self;
+        // crate `rrule` only takes date-times, not date-without-times, so
+        // convert the dt_start to a date-time
+        let dt_start = initial_recurrence.start().to_specific_time();
+        // convert from `chrono`'s `DateTime<Utc>` to `rrule`'s `DateTime<Tz>`,
+        // while still keeping UTC
+        let dt_start = rrule::Tz::Tz(chrono_tz::UTC).from_utc_datetime(&dt_start.naive_utc());
+
+        rrule::RRuleSet::new(dt_start).rrule(rrule.clone())
+    }
+}
+
 /// Module for safely encapsulating a recurrence rule iterator, working around
 /// the limitations of the `rrule` crate.
 mod recurrence_iter {
     use std::rc::Rc;
 
-    use chrono::TimeZone;
     use rrule::{RRuleSet, RRuleSetIter};
 
     use super::{IcalRecurrenceDesc, Period};
@@ -471,18 +589,9 @@ mod recurrence_iter {
         type IntoIter = IcalRecurrenceIter;
 
         fn into_iter(self) -> Self::IntoIter {
-            let IcalRecurrenceDesc { initial_recurrence, rrule } = self;
-
-            // crate `rrule` only takes date-times, not date-without-times, so
-            // convert the dt_start to a date-time
-            let dt_start = initial_recurrence.start().to_specific_time();
-            // convert from `chrono`'s `DateTime<Utc>` to `rrule`'s `DateTime<Tz>`,
-            // while still keeping UTC
-            let dt_start = rrule::Tz::Tz(chrono_tz::UTC).from_utc_datetime(&dt_start.naive_utc());
-
             // put the RRuleSet on the heap so that it can be borrowed by the
             // rrule iter
-            let rrule_set = Rc::new(RRuleSet::new(dt_start).rrule(rrule.clone()));
+            let rrule_set = Rc::new(self.to_rrule_set());
 
             // SAFETY: the RRuleSet that the RRuleSetIter borrows from is on the
             // heap and never moved from there, so references to it will remain
@@ -495,7 +604,7 @@ mod recurrence_iter {
                 unsafe { &*(rrule_set.as_ref() as *const RRuleSet) }.into_iter();
 
             IcalRecurrenceIter {
-                initial_recurrence: *initial_recurrence,
+                initial_recurrence: self.initial_recurrence,
                 rrule_iter,
                 _rrule_set: rrule_set,
             }
@@ -504,7 +613,7 @@ mod recurrence_iter {
 
     #[cfg(test)]
     mod test {
-        use chrono::{DateTime, Days, Duration, NaiveDate, NaiveTime, Utc};
+        use chrono::{DateTime, Days, Duration, NaiveDate, NaiveTime, TimeZone, Utc};
         use rrule::{Frequency, RRule};
 
         use super::*;
@@ -748,8 +857,10 @@ mod test {
             }],
             overrides: vec![OverrideInstance {
                 target: Moment::DateTime(gen_dt(0)),
-                new_period: Some(Period::DateTimeInterval { start: gen_dt(-5), end: gen_dt(-4) }),
-                event_data: Default::default(),
+                new_instance: Some((
+                    Period::DateTimeInterval { start: gen_dt(-5), end: gen_dt(-4) },
+                    Some(Default::default()),
+                )),
             }],
         };
 
@@ -897,5 +1008,78 @@ mod test {
                 &Segment { start: gen_dt(500), events: vec![id_d, id_e] },
             ]
         );
+    }
+
+    #[test]
+    fn event_set_get_instances_in_interval() {
+        fn gen_dt(offset_days: i64) -> DateTime<Utc> {
+            let reference = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+            reference + Duration::days(offset_days)
+        }
+
+        let event_set = EventSetData {
+            enumerated_instances: vec![
+                EnumeratedInstances {
+                    periods: vec![
+                        Period::DateTimeInterval { start: gen_dt(0), end: gen_dt(13) },
+                        Period::DateTimeInterval { start: gen_dt(3), end: gen_dt(7) },
+                        Period::DateTimeInterval { start: gen_dt(7), end: gen_dt(13) },
+                        Period::DateTimeInterval { start: gen_dt(13), end: gen_dt(17) },
+                        Period::DateTimeInterval { start: gen_dt(17), end: gen_dt(23) },
+                        Period::DateTimeInterval { start: gen_dt(23), end: gen_dt(27) },
+                    ],
+                    event_data: EventDataTimeless::default(),
+                },
+                EnumeratedInstances {
+                    periods: vec![
+                        Period::DateTimeInterval { start: gen_dt(5), end: gen_dt(6) },
+                        Period::DateTimeInterval { start: gen_dt(15), end: gen_dt(16) },
+                        Period::DateTimeInterval { start: gen_dt(25), end: gen_dt(26) },
+                    ],
+                    event_data: EventDataTimeless::default(),
+                },
+            ],
+            ical_recurring_instances: vec![IcalRecurringInstances {
+                reccurence_desc: IcalRecurrenceDesc {
+                    initial_recurrence: Period::DateTimeInterval {
+                        start: gen_dt(0),
+                        end: gen_dt(1),
+                    },
+                    rrule: RRule::new(Frequency::Daily)
+                        .interval(2)
+                        .validate(gen_dt(0).with_timezone(&rrule::Tz::UTC))
+                        .unwrap(),
+                },
+                event_data: EventDataTimeless::default(),
+            }],
+            overrides: vec![
+                // move an instance forward into the interval
+                OverrideInstance {
+                    target: Moment::DateTime(gen_dt(5)),
+                    new_instance: Some((
+                        Period::DateTimeInterval { start: gen_dt(15), end: gen_dt(16) },
+                        Some(Default::default()),
+                    )),
+                },
+                // move an instance backward into the interval
+                OverrideInstance {
+                    target: Moment::DateTime(gen_dt(25)),
+                    new_instance: Some((
+                        Period::DateTimeInterval { start: gen_dt(15), end: gen_dt(16) },
+                        Some(Default::default()),
+                    )),
+                },
+                // move an instance out of the interval
+                OverrideInstance { target: Moment::DateTime(gen_dt(23)), new_instance: None },
+            ],
+        };
+
+        let event_instances: Vec<_> =
+            event_set.get_instances_in_interval(gen_dt(10), gen_dt(20)).collect();
+
+        // it doesn't work because it doesn't check for overridden instances
+        // that might land inside the interval. this calls for a restructuring
+        // of the code
+        panic!();
     }
 }
