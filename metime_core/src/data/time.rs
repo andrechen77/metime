@@ -1,5 +1,5 @@
 use chrono::{DateTime, Days, Duration, NaiveDate, NaiveTime, TimeZone as _, Utc};
-use rrule::RRule;
+use rrule::{RRule, Unvalidated};
 
 /// Represents a single moment in time, which can be either a precise date-time
 /// or a single date.
@@ -13,7 +13,7 @@ impl Moment {
     // Forces the `Moment` to be a specific point in time. If it was just a date
     // in general, it will be converted to the specific date-time at the start
     // of that date.
-    fn to_specific_time(&self) -> DateTime<Utc> {
+    pub fn to_specific_time(&self) -> DateTime<Utc> {
         match self {
             Moment::DateTime(dt) => *dt,
             Moment::Date(date) => Utc.from_utc_datetime(&date.and_time(NaiveTime::MIN)),
@@ -24,7 +24,7 @@ impl Moment {
 /// Represents a period in time that an event can take up. This can be a
 /// precisely defined interval/point of date-time(s), or an imprecise
 /// interval of dates.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Period {
     /// A precise interval of date-times, including the start and excluding the
     /// end.
@@ -104,20 +104,38 @@ impl Period {
 /// A descriptor for all the periods in a recurring set of event instances.
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct IcalRecurrenceDesc {
+    /// The period of the first instance in this recurrence set. This must be
+    /// valid with respect to the recurrence rule.
+    initial_recurrence: Period,
+    /// The recurrence rule followed to generate all instances in this
+    /// recurrence set
+    rrule: RRule,
+    /// Any exceptions to the recurrence rule, which are dates that should not
+    /// be included in the recurrence set
+    exceptions: Vec<Moment>,
     // TODO allow a time zone to be attached; this is to allow stuff like "3pm
     // in this time zone" even when daylight savings happens
-    pub initial_recurrence: Period,
-    pub rrule: RRule,
-    // TODO these fields shouldn't be public
 }
 
 impl IcalRecurrenceDesc {
+    pub fn new(
+        initial_recurrence: Period,
+        rrule: RRule<Unvalidated>,
+        exceptions: Vec<Moment>,
+    ) -> Result<IcalRecurrenceDesc, rrule::RRuleError> {
+        // validate the rrule with respect to the initial recurrence
+        let rrule = rrule.validate(
+            initial_recurrence.start().to_specific_time().with_timezone(&rrule::Tz::UTC),
+        )?;
+        Ok(IcalRecurrenceDesc { initial_recurrence, rrule, exceptions })
+    }
+
     /// Returns the earliest and latest date-times that might be in the
     /// recurrence set. Returns overall `None` if there are no elements in the
     /// recurrence. The end point is `None` if the recurrence goes on to
     /// infinity.
     pub fn pessimistic_boundaries(&self) -> Option<(DateTime<Utc>, Option<DateTime<Utc>>)> {
-        let IcalRecurrenceDesc { initial_recurrence, rrule } = self;
+        let IcalRecurrenceDesc { initial_recurrence, rrule, .. } = self;
 
         // find the start point of the recurrence
         let start = initial_recurrence.pessimistic_boundaries().0;
@@ -143,6 +161,8 @@ impl IcalRecurrenceDesc {
         Some((start, end))
     }
 
+    /// Returns all the instances in the recurrence set that are in the given
+    /// interval, in order of occurrence. The interval is closed on both ends.
     pub fn get_all_instances_in_interval(
         &self,
         start: DateTime<Utc>,
@@ -158,15 +178,22 @@ impl IcalRecurrenceDesc {
     }
 
     fn to_rrule_set(&self) -> rrule::RRuleSet {
-        let IcalRecurrenceDesc { initial_recurrence, rrule } = self;
+        let IcalRecurrenceDesc { initial_recurrence, rrule, exceptions } = self;
         // crate `rrule` only takes date-times, not date-without-times, so
         // convert the dt_start to a date-time
         let dt_start = initial_recurrence.start().to_specific_time();
         // convert from `chrono`'s `DateTime<Utc>` to `rrule`'s `DateTime<Tz>`,
         // while still keeping UTC
-        let dt_start = rrule::Tz::Tz(chrono_tz::UTC).from_utc_datetime(&dt_start.naive_utc());
+        let dt_start = dt_start.with_timezone(&rrule::Tz::Tz(chrono_tz::UTC));
 
-        rrule::RRuleSet::new(dt_start).rrule(rrule.clone())
+        rrule::RRuleSet::new(dt_start).rrule(rrule.clone()).set_exdates(
+            exceptions
+                .iter()
+                .map(|moment| {
+                    moment.to_specific_time().with_timezone(&rrule::Tz::Tz(chrono_tz::UTC))
+                })
+                .collect(),
+        )
     }
 }
 
@@ -228,6 +255,8 @@ mod recurrence_iter {
         use chrono::{DateTime, Days, Duration, NaiveDate, NaiveTime, TimeZone, Utc};
         use rrule::{Frequency, RRule};
 
+        use crate::data::time::Moment;
+
         use super::*;
 
         #[test]
@@ -244,6 +273,9 @@ mod recurrence_iter {
                     .interval(2)
                     .validate(dt_start.with_timezone(&rrule::Tz::UTC))
                     .unwrap(),
+                exceptions: vec![
+                    gen_period(Utc.with_ymd_and_hms(2024, 1, 3, 0, 0, 0).unwrap()).start()
+                ],
             };
 
             let dates = rrule.into_iter().collect::<Vec<_>>();
@@ -251,7 +283,6 @@ mod recurrence_iter {
                 dates,
                 vec![
                     gen_period(Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap()),
-                    gen_period(Utc.with_ymd_and_hms(2024, 1, 3, 0, 0, 0).unwrap()),
                     gen_period(Utc.with_ymd_and_hms(2024, 1, 5, 0, 0, 0).unwrap()),
                 ]
             );
@@ -271,6 +302,7 @@ mod recurrence_iter {
                     .interval(2)
                     .validate(rrule::Tz::UTC.from_utc_datetime(&dt_start.and_time(NaiveTime::MIN)))
                     .unwrap(),
+                exceptions: vec![gen_period(NaiveDate::from_ymd_opt(2024, 1, 3).unwrap()).start()],
             };
 
             let dates = rrule.into_iter().collect::<Vec<_>>();
@@ -278,7 +310,6 @@ mod recurrence_iter {
                 dates,
                 vec![
                     gen_period(NaiveDate::from_ymd_opt(2024, 1, 1).unwrap()),
-                    gen_period(NaiveDate::from_ymd_opt(2024, 1, 3).unwrap()),
                     gen_period(NaiveDate::from_ymd_opt(2024, 1, 5).unwrap()),
                 ]
             );
@@ -288,6 +319,8 @@ mod recurrence_iter {
 
 #[cfg(test)]
 mod test {
+    use rrule::Frequency;
+
     use super::*;
 
     #[test]
@@ -312,6 +345,89 @@ mod test {
         assert_eq!(
             bound_right,
             Utc.with_ymd_and_hms(2024, 1, 4, 0, 0, 0).unwrap() + Duration::hours(12)
+        );
+    }
+
+    #[test]
+    fn ical_recurrence_desc_until_pessimistic_boundaries() {
+        let start = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+        let until = Utc.with_ymd_and_hms(2024, 1, 10, 0, 0, 0).unwrap();
+        let recurrence_desc = IcalRecurrenceDesc::new(
+            Period::DateTimeInterval { start, end: start + Duration::hours(1) },
+            RRule::new(Frequency::Daily).until(until.with_timezone(&rrule::Tz::UTC)).interval(2),
+            vec![],
+        )
+        .unwrap();
+
+        let (start_bound, end_bound) = recurrence_desc.pessimistic_boundaries().unwrap();
+        assert!(start_bound <= start);
+        assert!(end_bound.unwrap() >= start + Days::new(8) + Duration::hours(1));
+    }
+
+    #[test]
+    fn ical_recurrence_desc_count_pessimistic_boundaries() {
+        let start = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+        let recurrence_desc = IcalRecurrenceDesc::new(
+            Period::DateTimeInterval { start, end: start + Duration::hours(1) },
+            RRule::new(Frequency::Daily).count(10).interval(2),
+            vec![],
+        )
+        .unwrap();
+
+        let (start_bound, end_bound) = recurrence_desc.pessimistic_boundaries().unwrap();
+        assert!(start_bound <= start);
+        assert!(end_bound.unwrap() >= start + Days::new(18) + Duration::hours(1));
+    }
+
+    #[test]
+    fn ical_recurrence_desc_forever_pessimistic_boundaries() {
+        let start = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+        let recurrence_desc = IcalRecurrenceDesc::new(
+            Period::DateTimeInterval { start, end: start + Duration::hours(1) },
+            RRule::new(Frequency::Daily),
+            vec![],
+        )
+        .unwrap();
+
+        let (start_bound, end_bound) = recurrence_desc.pessimistic_boundaries().unwrap();
+        assert!(start_bound <= start);
+        assert_eq!(end_bound, None);
+    }
+
+    #[test]
+    fn ical_recurrence_desc_get_instances_in_interval() {
+        fn dt(offset_days: i64) -> DateTime<Utc> {
+            Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap() + Duration::days(offset_days)
+        }
+
+        fn period(offset_days: i64) -> Period {
+            Period::DateTimeInterval {
+                start: dt(offset_days),
+                end: dt(offset_days) + Duration::hours(1),
+            }
+        }
+
+        let recurrence_desc =
+            IcalRecurrenceDesc::new(period(0), RRule::new(Frequency::Daily), vec![]).unwrap();
+
+        let instances =
+            recurrence_desc.get_all_instances_in_interval(dt(10), dt(20)).collect::<Vec<_>>();
+
+        assert_eq!(
+            instances,
+            vec![
+                period(10),
+                period(11),
+                period(12),
+                period(13),
+                period(14),
+                period(15),
+                period(16),
+                period(17),
+                period(18),
+                period(19),
+                period(20),
+            ]
         );
     }
 }

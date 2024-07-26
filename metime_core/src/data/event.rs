@@ -1,4 +1,4 @@
-use std::{collections::HashMap, rc::Rc};
+use std::{collections::HashMap, convert::identity, rc::Rc};
 
 use chrono::{DateTime, Utc};
 
@@ -16,43 +16,33 @@ pub struct EventSetId(pub u64);
 
 #[derive(Debug, PartialEq, Eq, Clone, Default)]
 pub struct EventSetData {
-    pub overrides: Vec<OverrideInstance>,
-    pub enumerated_instances: Vec<EnumeratedInstances>,
-    pub ical_recurring_instances: Vec<IcalRecurringInstances>,
+    /// Single event instances in this event set. This vector must be
+    /// monotonically non-decreasing in the start time of the instances.
+    pub single_instance_records: Vec<SingleInstanceRecord>,
+    /// Recurring event instances in this event set. There is no restriction
+    /// on the order of the `IcalRecurrenceRecord`s.
+    pub ical_recurrence_records: Vec<IcalRecurrenceRecord>,
 }
 
-/// Enumerates a finite set of instances in the event set.
+/// Enumerates a single instance in the event set.
 #[derive(Debug, PartialEq, Eq, Clone)]
-pub struct EnumeratedInstances {
-    /// The periods of the instances of the event. The start times of the
-    /// periods must be monotonically increasing. Must be non-empty.
-    pub periods: Vec<Period>,
+pub struct SingleInstanceRecord {
+    /// When this event instance took place.
+    pub period: Period,
+    /// The data for this event instance.
     pub event_data: EventDataTimeless,
 }
 
 /// Defines a possibly infinite set of instances in the event set based on
 /// an iCalendar (RFC 5545) recurrence rule.
 #[derive(Debug, PartialEq, Eq, Clone)]
-pub struct IcalRecurringInstances {
-    pub reccurence_desc: IcalRecurrenceDesc,
+pub struct IcalRecurrenceRecord {
+    pub recurrence_desc: IcalRecurrenceDesc,
     pub event_data: EventDataTimeless,
 }
 
-/// Overrides an existing instancein the event set possibly rescheduling or
-/// deleting them. May also edit the data of the overrided instance.
-#[derive(Debug, PartialEq, Eq, Clone)]
-pub struct OverrideInstance {
-    /// The target instance to override. Must refer to an existing instance
-    /// of an event in the event set; cannot refer to the result of
-    /// overriding an instance.
-    pub target: Moment,
-    /// The overriden instance's period and event data. If this is None, the
-    /// instance is deleted. If only the event data is None, then the instance
-    /// retains its original data.
-    pub new_instance: Option<(Period, Option<EventDataTimeless>)>,
-}
-
-#[derive(Debug, Default, PartialEq, Eq, Clone)]
+/// Stores event data, except the time at which the event took place.
+#[derive(Debug, Default, PartialEq, Eq, Hash, Clone)]
 pub struct EventDataTimeless {
     /// The categories to which this event belongs.
     pub categories: Vec<CategoryId>,
@@ -63,21 +53,20 @@ pub struct EventDataTimeless {
 }
 
 /// Representation of the data for a particular event instance.
-pub struct EventInstance {
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
+pub struct EventInstance<'a> {
     pub period: Period,
-    pub data: EventDataTimeless,
+    pub event_data: &'a EventDataTimeless,
 }
 
 impl EventSetData {
     /// Returns a date-time before which it is guaranteed that there are no
     /// instances of the event set, and a date-time after which it is guaranteed
     /// that there are no instances of the event set. This includes the end
-    /// times of event instances.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the event set has no instances.
-    pub fn pessimistic_boundaries(&self) -> (DateTime<Utc>, Option<DateTime<Utc>>) {
+    /// times of event instances. The end bound is None if the event set goes
+    /// on to infinity. The entire return value is None if the event set has
+    /// no instances.
+    pub fn pessimistic_boundaries(&self) -> Option<(DateTime<Utc>, Option<DateTime<Utc>>)> {
         // None means there have been no instances yet to set any of the limits.
         // Some(limit) means that `limit` is the latest time that an instance of
         // this event set can occur. For `latest`, Some(None) means that the
@@ -113,362 +102,259 @@ impl EventSetData {
             };
         }
 
-        for EnumeratedInstances { periods, .. } in self.enumerated_instances.iter() {
-            for period in periods {
-                let (start, end) = period.pessimistic_boundaries();
-                expand_limits(&mut earliest, &mut latest, start, Some(end));
-            }
+        for SingleInstanceRecord { period, .. } in self.single_instance_records.iter() {
+            let (start, end) = period.pessimistic_boundaries();
+            expand_limits(&mut earliest, &mut latest, start, Some(end));
         }
-        for IcalRecurringInstances { reccurence_desc, .. } in self.ical_recurring_instances.iter() {
-            let Some((start, end)) = reccurence_desc.pessimistic_boundaries() else {
-                continue;
-            };
-
-            expand_limits(&mut earliest, &mut latest, start, end);
-        }
-        for OverrideInstance { new_instance, .. } in self.overrides.iter() {
-            if let Some((new_period, _)) = new_instance {
-                let (start, end) = new_period.pessimistic_boundaries();
-                expand_limits(&mut earliest, &mut latest, start, Some(end));
+        for IcalRecurrenceRecord { recurrence_desc: reccurence_desc, .. } in
+            self.ical_recurrence_records.iter()
+        {
+            if let Some((start, end)) = reccurence_desc.pessimistic_boundaries() {
+                expand_limits(&mut earliest, &mut latest, start, end);
             }
         }
 
-        (
-            earliest.expect("should be at least one record in the event set"),
-            latest.expect("shoudl be at least one record in the event set"),
-        )
+        if let (Some(earliest), Some(latest)) = (earliest, latest) {
+            Some((earliest, latest))
+        } else {
+            None
+        }
     }
 
     /// Returns an iterator over all instances of the event set that are in the
-    /// specified interval. The instances are not necessarily returned in the
-    /// order of their start time.
-    pub fn get_instances_in_interval(
-        &self,
+    /// specified closed interval. The instances are not necessarily returned in
+    /// the order of their start time.
+    pub fn get_instances_in_interval<'s>(
+        &'s self,
         start: DateTime<Utc>,
         end: DateTime<Utc>,
-    ) -> impl Iterator<Item = EventInstance> + '_ {
-        let EventSetData { overrides, enumerated_instances, ical_recurring_instances } = self;
+    ) -> impl Iterator<Item = EventInstance<'s>> + 's {
+        let EventSetData { single_instance_records, ical_recurrence_records } = self;
 
-        let overrides: Rc<HashMap<_, _>> = Rc::new(HashMap::from_iter(overrides.iter().map(
-            |OverrideInstance { target, new_instance: new_period }| {
-                (target.clone(), new_period.clone())
-            },
-        )));
-        // converts a period into an EventInstance, taking in to account
-        // possible overrides
-        fn maybe_override(
-            period: &Period,
-            original_event_data: &EventDataTimeless,
-            overrides: &HashMap<Moment, Option<(Period, Option<EventDataTimeless>)>>,
-        ) -> Option<EventInstance> {
-            if let Some(new_instance) = overrides.get(&period.start()) {
-                if let Some((new_period, new_data)) = new_instance {
-                    Some(EventInstance {
-                        period: *new_period,
-                        data: new_data.as_ref().cloned().unwrap_or(original_event_data.clone()),
-                    })
-                } else {
-                    // this instance was deleted
-                    None
+        let single_instances = single_instance_records
+            .iter()
+            // filter eligible periods
+            .filter_map(move |SingleInstanceRecord { period, event_data }| {
+                let (earliest, latest) = period.pessimistic_boundaries();
+                if earliest > end {
+                    // no other instance after this one can possibly
+                    // be within the interval because they are
+                    // sorted by start time
+                    return None;
                 }
-            } else {
-                Some(EventInstance { period: *period, data: original_event_data.clone() })
-            }
-        }
+                if latest > start {
+                    let event_instance = EventInstance { period: *period, event_data };
+                    return Some(Some(event_instance));
+                } else {
+                    // this instance is before the interval, but
+                    // later instances might still be within the
+                    // interval
+                    return Some(None);
+                }
+            })
+            // stop iteration on the first event that is after the interval;
+            // this is a performance optimization to stop looking for eligible
+            // instances after we are already past the interval
+            .fuse()
+            // eliminate the `Some(None)` cases from above
+            .filter_map(identity);
 
-        let overrides_too = overrides.clone();
-        let enumerated = enumerated_instances.iter().flat_map(
-            move |EnumeratedInstances { periods, event_data }| {
-                let overrides_too = overrides_too.clone();
-                periods
-                    .iter()
-                    // filter out eligible periods
-                    .filter_map(move |period| {
-                        let (earliest, latest) = period.pessimistic_boundaries();
-                        if earliest > end {
-                            // no other instance after this one can possibly
-                            // be within the interval because they are
-                            // sorted by start time
-                            return None;
-                        }
-                        if latest >= start {
-                            return Some(Some(period));
-                        } else {
-                            // this instance is before the interval, but
-                            // later instances might still be within the
-                            // interval
-                            return Some(None);
-                        }
-                    })
-                    // stop iteration on the first event that is after the interval;
-                    // this is a performance operation to stop looking for eligible
-                    // instances after we are already past the interval
-                    .fuse()
-                    // eliminate the `Some(None)` cases from above, while also
-                    // accounting for overridden events
-                    .filter_map(move |maybe_period| {
-                        maybe_period.and_then(|period| {
-                            maybe_override(period, event_data, overrides_too.as_ref())
-                        })
-                    })
+        let recurring = ical_recurrence_records.iter().flat_map(
+            move |IcalRecurrenceRecord { recurrence_desc: reccurence_desc, event_data }| {
+                reccurence_desc
+                    .get_all_instances_in_interval(start, end)
+                    .map(|period| EventInstance { period, event_data })
             },
         );
 
-        let overrides_too = overrides.clone();
-        let recurring = ical_recurring_instances.iter().flat_map(
-            move |IcalRecurringInstances { reccurence_desc, event_data }| {
-                let overrides_too = overrides_too.clone();
-                reccurence_desc.get_all_instances_in_interval(start, end).filter_map(
-                    move |period| maybe_override(&period, event_data, overrides_too.as_ref()),
-                )
-            },
-        );
-
-        recurring.chain(enumerated)
+        recurring.chain(single_instances)
     }
 }
 
 #[cfg(test)]
 mod test {
-    use chrono::{Duration, TimeZone as _};
+    use std::{collections::HashSet, vec};
+
+    use chrono::{Datelike, Duration, TimeZone as _};
     use rrule::{Frequency, RRule};
 
     use super::*;
 
+    fn dt(offset_days: i64) -> DateTime<Utc> {
+        let reference = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+        reference + Duration::days(offset_days)
+    }
+
+    fn period(offset_days_start: i64, offset_days_end: i64) -> Period {
+        Period::DateTimeInterval { start: dt(offset_days_start), end: dt(offset_days_end) }
+    }
+
+    fn single_instance(offset_days_start: i64, offset_days_end: i64) -> SingleInstanceRecord {
+        SingleInstanceRecord {
+            period: period(offset_days_start, offset_days_end),
+            event_data: EventDataTimeless::default(),
+        }
+    }
+
     #[test]
     fn enumerated_instances_pessimistic_boundaries() {
-        fn gen_dt(offset_days: i64) -> DateTime<Utc> {
-            let reference = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
-            reference + Duration::days(offset_days)
-        }
-
         let event_set = EventSetData {
-            enumerated_instances: vec![EnumeratedInstances {
-                periods: vec![
-                    Period::DateTimeInterval { start: gen_dt(0), end: gen_dt(3) },
-                    Period::DateTimeInterval { start: gen_dt(1), end: gen_dt(2) },
-                ],
-                event_data: EventDataTimeless::default(),
-            }],
+            single_instance_records: vec![single_instance(0, 3), single_instance(1, 2)],
             ..Default::default()
         };
-        let (earliest, latest) = event_set.pessimistic_boundaries();
-        assert_eq!(earliest, gen_dt(0));
-        assert_eq!(latest, Some(gen_dt(3)));
+
+        let Some((earliest, latest)) = event_set.pessimistic_boundaries() else {
+            unreachable!();
+        };
+        assert_eq!(earliest, dt(0));
+        assert_eq!(latest, Some(dt(3)));
 
         let event_set = EventSetData {
-            enumerated_instances: vec![EnumeratedInstances {
-                periods: vec![
-                    Period::DateTimeInterval { start: gen_dt(0), end: gen_dt(3) },
-                    Period::DateTime(gen_dt(4)),
-                    Period::DateTimeInterval { start: gen_dt(1), end: gen_dt(2) },
-                ],
-                event_data: EventDataTimeless::default(),
-            }],
+            single_instance_records: vec![
+                single_instance(0, 3),
+                single_instance(3, 4),
+                single_instance(1, 2),
+            ],
             ..Default::default()
         };
-        let (earliest, latest) = event_set.pessimistic_boundaries();
-        assert_eq!(earliest, gen_dt(0));
-        assert_eq!(latest, Some(gen_dt(4)));
+
+        assert_eq!(event_set.pessimistic_boundaries(), Some((dt(0), Some(dt(4)))));
     }
 
     #[test]
     fn ical_recurrence_count_pessimistic_boundaries() {
         let dt_start = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
-        let rrule = IcalRecurrenceDesc {
-            initial_recurrence: Period::DateTimeInterval {
-                start: dt_start,
-                end: dt_start + Duration::hours(1),
-            },
-            rrule: RRule::new(Frequency::Daily)
-                .interval(2)
-                .count(3)
-                .validate(dt_start.with_timezone(&rrule::Tz::UTC))
-                .unwrap(),
-        };
+        let recurrence_desc = IcalRecurrenceDesc::new(
+            Period::DateTimeInterval { start: dt_start, end: dt_start + Duration::hours(1) },
+            RRule::new(Frequency::Daily).interval(2).count(3),
+            vec![],
+        )
+        .unwrap();
 
         let event_set = EventSetData {
-            ical_recurring_instances: vec![IcalRecurringInstances {
-                reccurence_desc: rrule,
+            ical_recurrence_records: vec![IcalRecurrenceRecord {
+                recurrence_desc,
                 event_data: EventDataTimeless::default(),
             }],
             ..Default::default()
         };
 
-        let (earliest, latest) = event_set.pessimistic_boundaries();
-        assert_eq!(earliest, dt_start);
-        assert_eq!(latest, Some(Utc.with_ymd_and_hms(2024, 1, 5, 1, 0, 0).unwrap()));
+        assert_eq!(
+            event_set.pessimistic_boundaries(),
+            Some((dt_start, Some(Utc.with_ymd_and_hms(2024, 1, 5, 1, 0, 0).unwrap())))
+        );
     }
 
     #[test]
     fn ical_recurrence_until_pessimistic_boundaries() {
         let dt_start = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
         let until = Utc.with_ymd_and_hms(2024, 1, 20, 0, 0, 0).unwrap();
-        let rrule = IcalRecurrenceDesc {
-            initial_recurrence: Period::DateTimeInterval {
-                start: dt_start,
-                end: dt_start + Duration::hours(1),
-            },
-            rrule: RRule::new(Frequency::Daily)
-                .interval(2)
-                .until(until.with_timezone(&rrule::Tz::UTC))
-                .validate(dt_start.with_timezone(&rrule::Tz::UTC))
-                .unwrap(),
-        };
+        let recurrence_desc = IcalRecurrenceDesc::new(
+            Period::DateTimeInterval { start: dt_start, end: dt_start + Duration::hours(1) },
+            RRule::new(Frequency::Daily).interval(2).until(until.with_timezone(&rrule::Tz::UTC)),
+            vec![],
+        )
+        .unwrap();
 
         let event_set = EventSetData {
-            ical_recurring_instances: vec![IcalRecurringInstances {
-                reccurence_desc: rrule,
+            ical_recurrence_records: vec![IcalRecurrenceRecord {
+                recurrence_desc,
                 event_data: EventDataTimeless::default(),
             }],
             ..Default::default()
         };
 
-        let (earliest, latest) = event_set.pessimistic_boundaries();
-        assert_eq!(earliest, dt_start);
-        assert_eq!(latest, Some(until + Duration::hours(1)));
+        assert_eq!(
+            event_set.pessimistic_boundaries(),
+            Some((dt_start, Some(until + Duration::hours(1))))
+        );
     }
 
     #[test]
     fn ical_recurrence_forever_pessimistic_boundaries() {
         let dt_start = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
-        let rrule = IcalRecurrenceDesc {
-            initial_recurrence: Period::DateTimeInterval {
-                start: dt_start,
-                end: dt_start + Duration::hours(1),
-            },
-            rrule: RRule::new(Frequency::Daily)
-                .interval(2)
-                .validate(dt_start.with_timezone(&rrule::Tz::UTC))
-                .unwrap(),
-        };
+        let recurrence_desc = IcalRecurrenceDesc::new(
+            Period::DateTimeInterval { start: dt_start, end: dt_start + Duration::hours(1) },
+            RRule::new(Frequency::Daily).interval(2),
+            vec![],
+        )
+        .unwrap();
 
         let event_set = EventSetData {
-            ical_recurring_instances: vec![IcalRecurringInstances {
-                reccurence_desc: rrule,
+            ical_recurrence_records: vec![IcalRecurrenceRecord {
+                recurrence_desc,
                 event_data: EventDataTimeless::default(),
             }],
             ..Default::default()
         };
 
-        let (earliest, latest) = event_set.pessimistic_boundaries();
-        assert_eq!(earliest, dt_start);
-        assert_eq!(latest, None);
+        assert_eq!(event_set.pessimistic_boundaries(), Some((dt_start, None)));
     }
 
     #[test]
     fn all_records_pessimistic_boundaries() {
-        fn gen_dt(offset_days: i64) -> DateTime<Utc> {
-            let reference = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
-            reference + Duration::days(offset_days)
-        }
-
         let event_set = EventSetData {
-            enumerated_instances: vec![EnumeratedInstances {
-                periods: vec![
-                    Period::DateTimeInterval { start: gen_dt(0), end: gen_dt(3) },
-                    Period::DateTimeInterval { start: gen_dt(1), end: gen_dt(2) },
-                ],
-                event_data: EventDataTimeless::default(),
-            }],
-            ical_recurring_instances: vec![IcalRecurringInstances {
-                reccurence_desc: IcalRecurrenceDesc {
-                    initial_recurrence: Period::DateTimeInterval {
-                        start: gen_dt(2),
-                        end: gen_dt(2) + Duration::hours(25),
-                    },
-                    rrule: RRule::new(Frequency::Weekly)
+            single_instance_records: vec![single_instance(0, 3), single_instance(1, 2)],
+            ical_recurrence_records: vec![IcalRecurrenceRecord {
+                recurrence_desc: IcalRecurrenceDesc::new(
+                    Period::DateTimeInterval { start: dt(2), end: dt(2) + Duration::hours(25) },
+                    RRule::new(Frequency::Weekly)
                         .interval(2)
-                        .until(gen_dt(50).with_timezone(&rrule::Tz::UTC))
-                        .validate(gen_dt(2).with_timezone(&rrule::Tz::UTC))
-                        .unwrap(),
-                },
+                        .until(dt(50).with_timezone(&rrule::Tz::UTC)),
+                    vec![],
+                )
+                .unwrap(),
                 event_data: EventDataTimeless::default(),
-            }],
-            overrides: vec![OverrideInstance {
-                target: Moment::DateTime(gen_dt(0)),
-                new_instance: Some((
-                    Period::DateTimeInterval { start: gen_dt(-5), end: gen_dt(-4) },
-                    Some(Default::default()),
-                )),
             }],
         };
 
-        let (earliest, latest) = event_set.pessimistic_boundaries();
-        assert_eq!(earliest, gen_dt(-5));
-        assert_eq!(latest, Some(gen_dt(50) + Duration::hours(25)));
+        assert_eq!(
+            event_set.pessimistic_boundaries(),
+            Some((dt(0), Some(dt(50) + Duration::hours(25))))
+        );
     }
 
     #[test]
     fn event_set_get_instances_in_interval() {
-        fn gen_dt(offset_days: i64) -> DateTime<Utc> {
-            let reference = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
-            reference + Duration::days(offset_days)
-        }
-
         let event_set = EventSetData {
-            enumerated_instances: vec![
-                EnumeratedInstances {
-                    periods: vec![
-                        Period::DateTimeInterval { start: gen_dt(0), end: gen_dt(13) },
-                        Period::DateTimeInterval { start: gen_dt(3), end: gen_dt(7) },
-                        Period::DateTimeInterval { start: gen_dt(7), end: gen_dt(13) },
-                        Period::DateTimeInterval { start: gen_dt(13), end: gen_dt(17) },
-                        Period::DateTimeInterval { start: gen_dt(17), end: gen_dt(23) },
-                        Period::DateTimeInterval { start: gen_dt(23), end: gen_dt(27) },
-                    ],
-                    event_data: EventDataTimeless::default(),
-                },
-                EnumeratedInstances {
-                    periods: vec![
-                        Period::DateTimeInterval { start: gen_dt(5), end: gen_dt(6) },
-                        Period::DateTimeInterval { start: gen_dt(15), end: gen_dt(16) },
-                        Period::DateTimeInterval { start: gen_dt(25), end: gen_dt(26) },
-                    ],
-                    event_data: EventDataTimeless::default(),
-                },
+            single_instance_records: vec![
+                single_instance(0, 13),
+                single_instance(3, 7),
+                single_instance(7, 13),
+                single_instance(13, 17),
+                single_instance(17, 23),
+                single_instance(23, 27),
+                single_instance(5, 10),
+                single_instance(20, 25),
             ],
-            ical_recurring_instances: vec![IcalRecurringInstances {
-                reccurence_desc: IcalRecurrenceDesc {
-                    initial_recurrence: Period::DateTimeInterval {
-                        start: gen_dt(0),
-                        end: gen_dt(1),
-                    },
-                    rrule: RRule::new(Frequency::Daily)
-                        .interval(2)
-                        .validate(gen_dt(0).with_timezone(&rrule::Tz::UTC))
-                        .unwrap(),
-                },
+            ical_recurrence_records: vec![IcalRecurrenceRecord {
+                recurrence_desc: IcalRecurrenceDesc::new(
+                    period(1, 2),
+                    RRule::new(Frequency::Daily).interval(2),
+                    vec![Moment::DateTime(dt(13))],
+                )
+                .unwrap(),
                 event_data: EventDataTimeless::default(),
             }],
-            overrides: vec![
-                // move an instance forward into the interval
-                OverrideInstance {
-                    target: Moment::DateTime(gen_dt(5)),
-                    new_instance: Some((
-                        Period::DateTimeInterval { start: gen_dt(15), end: gen_dt(16) },
-                        Some(Default::default()),
-                    )),
-                },
-                // move an instance backward into the interval
-                OverrideInstance {
-                    target: Moment::DateTime(gen_dt(25)),
-                    new_instance: Some((
-                        Period::DateTimeInterval { start: gen_dt(15), end: gen_dt(16) },
-                        Some(Default::default()),
-                    )),
-                },
-                // move an instance out of the interval
-                OverrideInstance { target: Moment::DateTime(gen_dt(23)), new_instance: None },
-            ],
         };
 
-        let event_instances: Vec<_> =
-            event_set.get_instances_in_interval(gen_dt(10), gen_dt(20)).collect();
+        let event_instances: HashSet<_> =
+            event_set.get_instances_in_interval(dt(10), dt(20)).collect();
 
-        // it doesn't work because it doesn't check for overridden instances
-        // that might land inside the interval. this calls for a restructuring
-        // of the code
-        panic!();
+        let event_data = &EventDataTimeless::default();
+        let expected_event_instances = HashSet::from([
+            EventInstance { period: period(0, 13), event_data },
+            EventInstance { period: period(7, 13), event_data },
+            EventInstance { period: period(13, 17), event_data },
+            EventInstance { period: period(17, 23), event_data },
+            EventInstance { period: period(20, 25), event_data },
+            EventInstance { period: period(11, 12), event_data },
+            // 13-14 is skipped because it is an exception date.
+            EventInstance { period: period(15, 16), event_data },
+            EventInstance { period: period(17, 18), event_data },
+            EventInstance { period: period(19, 20), event_data },
+        ]);
+
+        assert_eq!(event_instances, expected_event_instances);
     }
 }

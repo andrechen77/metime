@@ -52,7 +52,7 @@ impl Database {
     pub fn add_event_set(&mut self, event_set: EventSetData) -> EventSetId {
         let id = self.gen_unique_event_set_id();
 
-        let (earliest, latest) = event_set.pessimistic_boundaries();
+        let (earliest, latest) = event_set.pessimistic_boundaries().unwrap(); // TODO handle error
         self.event_sets.insert(id, event_set);
 
         self.ensure_segments_back_to(earliest);
@@ -172,7 +172,7 @@ impl Default for DatabaseManifest {
 
 #[cfg(test)]
 mod test {
-    use super::super::event::{EnumeratedInstances, EventDataTimeless};
+    use super::super::event::{EventDataTimeless, SingleInstanceRecord};
     use super::super::time::Period;
     use chrono::TimeZone as _;
 
@@ -235,8 +235,8 @@ mod test {
         let mut db = Database::new();
 
         let event_set = EventSetData {
-            enumerated_instances: vec![EnumeratedInstances {
-                periods: vec![Period::DateTimeInterval { start: a, end: b }],
+            single_instance_records: vec![SingleInstanceRecord {
+                period: Period::DateTimeInterval { start: a, end: b },
                 event_data: EventDataTimeless::default(),
             }],
             ..Default::default()
@@ -260,8 +260,8 @@ mod test {
             let a = gen_dt(start_offset_days);
             let b = gen_dt(end_offset_days);
             EventSetData {
-                enumerated_instances: vec![EnumeratedInstances {
-                    periods: vec![Period::DateTimeInterval { start: a, end: b }],
+                single_instance_records: vec![SingleInstanceRecord {
+                    period: Period::DateTimeInterval { start: a, end: b },
                     event_data: EventDataTimeless::default(),
                 }],
                 ..Default::default()
