@@ -151,7 +151,7 @@ impl IcalRecurrenceDesc {
         let start = rrule::Tz::Tz(chrono_tz::UTC).from_utc_datetime(&start.naive_utc());
         let end = rrule::Tz::Tz(chrono_tz::UTC).from_utc_datetime(&end.naive_utc());
         let rrule_set = self.to_rrule_set().after(start).before(end);
-        let rrule::RRuleResult { dates, limited: true } = rrule_set.all(u16::MAX) else {
+        let rrule::RRuleResult { dates, limited: false } = rrule_set.all(u16::MAX) else {
             panic!("there are way too many event instances to handle here");
         };
         dates.into_iter().map(|dt| self.initial_recurrence.shift_start_coerce(dt.to_utc()))
