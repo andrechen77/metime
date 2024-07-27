@@ -1,6 +1,7 @@
 [workspace]
 
 members = [
-    "metime_core"
+    "metime_core",
+    "metime-gui-dx",
 ]
 resolver = "2"
