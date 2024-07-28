@@ -2,5 +2,5 @@
 
 members = [
     "metime_core"
-]
+, "metime_gui_leptos"]
 resolver = "2"
