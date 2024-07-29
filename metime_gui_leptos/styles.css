@@ -1,0 +1,18 @@
+.app-container {
+	background-color: lightgray;
+	height: 80vh;
+	display: flex;
+	flex-direction: column;
+}
+
+.column-grid__container {
+	flex-grow: 1;
+	border: 10px solid red;
+	display: grid;
+	grid: auto / auto-flow 1fr;
+	gap: 0.5em;
+}
+
+.column-grid__column {
+	border: 1px solid red;
+}
