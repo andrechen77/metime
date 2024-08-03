@@ -14,5 +14,18 @@
 }
 
 .column-grid__column {
+	border: 1px solid blue;
+	display: flex;
+	flex-direction: column;
+}
+
+.column-grid__column-area {
 	border: 1px solid red;
+	position: relative;
+	flex-grow: 1;
+}
+
+.event-box {
+	position: absolute;
+	background-color: green;
 }

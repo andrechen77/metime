@@ -8,73 +8,91 @@ fn main() {
 
 #[component]
 fn App() -> impl IntoView {
-    let (events, set_events) = create_signal(vec![
-        Event { day: 0, start: 0, end: 1 },
-        Event { day: 1, start: 1, end: 2 },
-        Event { day: 2, start: 2, end: 3 },
-        Event { day: 3, start: 3, end: 4 },
+    let events = create_rw_signal(vec![
+        create_rw_signal(Event { id: 0, day: 0, start: 0, end: 2 }),
+        create_rw_signal(Event { id: 1, day: 1, start: 1, end: 2 }),
+        create_rw_signal(Event { id: 2, day: 2, start: 2, end: 3 }),
+        create_rw_signal(Event { id: 3, day: 3, start: 3, end: 7 }),
     ]);
-    let (day_span, set_day_span) = create_signal((0, 7));
+    let day_span = create_rw_signal((0, 7));
 
-    let go_left = move |_| set_day_span.update(|(start, _)| *start -= 1);
-    let go_right = move |_| set_day_span.update(|(start, _)| *start += 1);
+    let go_left = move |_| day_span.update(|(start, _)| *start -= 1);
+    let go_right = move |_| day_span.update(|(start, _)| *start += 1);
 
     view! {
         <div class="app-container">
-            <ColumnGrid events day_span/>
+            <ColumnGrid events day_span=day_span.read_only()/>
         </div>
         <button on:click=go_left>{"Left"}</button>
         <button on:click=go_right>{"Right"}</button>
-
     }
 }
 
 #[component]
 fn ColumnGrid(
-    events: ReadSignal<Vec<Event>>,
+    events: RwSignal<Vec<RwSignal<Event>>>,
     day_span: ReadSignal<(i32, usize)>,
 ) -> impl IntoView {
-    let event_buckets = create_memo(move |_| {
-        logging::log!("rerunning memo");
+    let event_buckets = move || {
+        logging::log!("Recomputing event buckets");
         let (start, span) = day_span.get();
         let mut event_buckets: Vec<_> = (0..span).map(|i| (start + i as i32, Vec::new())).collect();
         events.with(|events| {
             for event in events {
-                let index = (event.day - start) as usize;
+                let index = event.with(|e| e.day - start) as usize;
                 if index < event_buckets.len() {
                     event_buckets[index].1.push(*event);
                 }
             }
         });
         event_buckets
-    });
+    };
 
     view! {
         <div class="column-grid__container">
             <For
-                each=move || event_buckets.get()
+                each=event_buckets
                 key=|(day, _)| *day
-                children=|(day, events)| {
-                    view! {
-                        <div>
-                            <p>{format!("Day {}", day)}</p>
+                children=|(day, events)| view! {
+                    <div class="column-grid__column">
+                        <p>{format!("Day {}", day)}</p>
+                        <div class="column-grid__column-area">
                             <For
                                 each=move || events.clone()
-                                key=|event| *event
+                                key=|event| event.with(|event| event.id)
                                 let:event
                             >
-                                <div>{format!("{} - {}", event.start, event.end)}</div>
+                                <EventBox event/>
                             </For>
                         </div>
-                    }
+                    </div>
                 }
             />
         </div>
     }
 }
 
+#[component]
+fn EventBox(
+    event: RwSignal<Event>,
+) -> impl IntoView {
+    let text = move || event.with(|event| format!("{} - {}", event.start, event.end));
+    let vertical_position = move || event.with(|event| format!("{}%", event.start * 10));
+    let height = move || event.with(|event| format!("{}%", (event.end - event.start) * 10));
+
+    view! {
+        <div
+            class="event-box"
+            style:top=vertical_position
+            style:height=height
+            style:width="100%"
+        >{text}</div>
+    }
+}
+
 #[derive(PartialEq, Eq, Hash, Clone, Copy)]
 struct Event {
+    id: u32,
     day: i32,
     start: u32,
     end: u32,
