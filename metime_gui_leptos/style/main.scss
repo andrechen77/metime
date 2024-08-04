@@ -1,12 +1,6 @@
-.app-container {
-	background-color: lightgray;
-	height: 80vh;
-	display: flex;
-	flex-direction: column;
-}
+@import "./leptonic/leptonic-themes";
 
 .column-grid__container {
-	flex-grow: 1;
 	border: 10px solid red;
 	display: grid;
 	grid: auto / auto-flow 1fr;
@@ -29,3 +23,4 @@
 	position: absolute;
 	background-color: green;
 }
+

@@ -1,4 +1,5 @@
 use leptos::*;
+use leptonic::prelude::*;
 
 fn main() {
     println!("Hello, world!");
@@ -20,11 +21,15 @@ fn App() -> impl IntoView {
     let go_right = move |_| day_span.update(|(start, _)| *start += 1);
 
     view! {
-        <div class="app-container">
-            <ColumnGrid events day_span=day_span.read_only()/>
-        </div>
-        <button on:click=go_left>{"Left"}</button>
-        <button on:click=go_right>{"Right"}</button>
+        <Root default_theme=LeptonicTheme::default()>
+            <Stack spacing=Size::Zero>
+                <ColumnGrid events day_span=day_span.read_only()/>
+                <Stack spacing=Size::Em(1.0) orientation=StackOrientation::Horizontal>
+                    <Button on_click=go_left>{"Left"}</Button>
+                    <Button on_click=go_right>{"Right"}</Button>
+                </Stack>
+            </Stack>
+        </Root>
     }
 }
 
@@ -49,7 +54,7 @@ fn ColumnGrid(
     };
 
     view! {
-        <div class="column-grid__container">
+        <div class="column-grid__container" style:height="80vh" style:width="100%">
             <For
                 each=event_buckets
                 key=|(day, _)| *day
